@@ -275,7 +275,7 @@ typedef struct {
     uint32_t version : 12;
 } entity_t;
 
-#define ECS_QUERY_MAX_CLAUSES 4
+#define ECS_QUERY_MAX_CLAUSES 8
 #define ECS_QUERY_MAX_TERMS   8
 
 typedef struct ecs_world_t ecs_world_t;
@@ -494,6 +494,17 @@ void     ecs_world_set_mode(ecs_world_t* world, ecs_mode_t mode);
 void     ecs_tree_set_mode(ecs_tree_t* tree, ecs_mode_t mode);
 void     ecs_tree_destroy(ecs_tree_t* tree);
 void     ecs_world_destroy(ecs_world_t* world);
+
+/* Initialize a zero-initialized world. Reserves trees[0] as the entity
+   table: a POD entity_t tree (name = "entity"), bit 0 set in world->mask.
+   Must be called before ecs_entity_spawn. Other trees added by caller. */
+void     ecs_world_init(ecs_world_t* world);
+
+/* Allocate a new entity in trees[0]. Picks the lowest-index free slot via
+   ctz on the inverted predicted_mask_all/any chain (L3 -> L2 -> L1).
+   Stamps the slot with entity_t{ id = idx, version = predicted_tick & 0xFFF }
+   and returns it. Asserts trees[0] inited and table not full (2^18 cap). */
+entity_t ecs_entity_spawn(ecs_world_t* world);
 
 /* Get mutable pointer to slot, marking it as written-this-frame. Acquires
    L2/L1 if absent. Sets predicted/confirmed/dirty/changed masks

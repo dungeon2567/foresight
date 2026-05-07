@@ -857,6 +857,42 @@ void ecs_world_set_mode(ecs_world_t* world, ecs_mode_t mode) {
     world->mode = mode;
 }
 
+void ecs_world_init(ecs_world_t* world) {
+    assert(world);
+    assert(!world->trees[0].root && "ecs_world_init: already initialized");
+    ecs_tree_t* tree = &world->trees[0];
+    ecs_tree_init(tree, sizeof(entity_t), 0);
+    tree->name   = "entity";
+    tree->mode   = world->mode;
+    world->mask |= 1ULL;
+}
+
+entity_t ecs_entity_spawn(ecs_world_t* world) {
+    assert(world);
+    ecs_tree_t* tree = &world->trees[0];
+    assert(tree->root && tree->data_size == sizeof(entity_t) &&
+           "ecs_entity_spawn: call ecs_world_init first");
+
+    /* Lowest free idx via ctz on inverted mask_all chain. Default L2/L1 nodes
+       carry zero masks, so inv = ~0 -> ctz = 0 falls through cleanly without
+       branching on the "subtree not yet allocated" case -- ecs_tree_get_mut
+       handles allocation. */
+    ecs_l3_t* l3 = tree->root;
+    uint64_t inv3 = ~l3->predicted_mask_all;
+    assert(inv3 && "ecs_entity_spawn: entity table full");
+    int i = ecs_ctz64(inv3);
+    const ecs_l2_t* l2 = l3->children[i];
+    int j = ecs_ctz64(~l2->predicted_mask_all);
+    const ecs_l1_t* l1 = l2->children[j];
+    int k = ecs_ctz64(~l1->predicted_mask_any);
+
+    int idx = (i << 12) | (j << 6) | k;
+    entity_t e = { .id = (uint32_t)idx,
+                   .version = world->predicted_tick & 0xFFFu };
+    *(entity_t*)ecs_tree_get_mut(tree, idx) = e;
+    return e;
+}
+
 void ecs_world_destroy(ecs_world_t* world) {
     if (!world) return;
     uint64_t mask = world->mask;
