@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fixed.h"
+#include "ecs_fixed.h"
 
 /* ============================================================
    bitops + branch hints

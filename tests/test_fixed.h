@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdio.h>
-#include "fixed.h"
+#include "ecs_fixed.h"
 
 /* Reuses g_passed / g_failed / EXPECT defined in test_ecs.h.
    test_ecs.h must be included before this file in the TU. */

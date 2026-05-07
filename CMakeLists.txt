@@ -123,8 +123,8 @@ if (ECS_BUILD_TESTS)
         src/ecs_tree.c
         src/ecs_world.c
         src/ecs_query.c
-        src/broadphase.c
-        src/input.c
+        src/ecs_broadphase.c
+        src/ecs_input.c
     )
 
     target_include_directories(ecs PRIVATE
@@ -161,7 +161,7 @@ if (ECS_BUILD_BENCH)
         src/ecs_tree.c
         src/ecs_world.c
         src/ecs_query.c
-        src/broadphase.c
+        src/ecs_broadphase.c
     )
 
     target_include_directories(ecs_bench PRIVATE
@@ -180,7 +180,7 @@ endif()
 # -------------------------
 # Compiler options
 # -------------------------
-# fixed.h SIMD backend selects via arch macros: x86 → SSE4.1+AVX2, arm64 → NEON,
+# ecs_fixed.h SIMD backend selects via arch macros: x86 → SSE4.1+AVX2, arm64 → NEON,
 # else scalar. x86-only flags (/arch:AVX2, -msse4.1, -mavx2) must be gated.
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86|x86)$")
     set(ECS_ARCH_X86 TRUE)

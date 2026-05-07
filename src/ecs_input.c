@@ -1,4 +1,4 @@
-#include "input.h"
+#include "ecs_input.h"
 
 #include <assert.h>
 #include <stdint.h>

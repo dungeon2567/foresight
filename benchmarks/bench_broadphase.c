@@ -1,5 +1,5 @@
 #include "bench_broadphase.h"
-#include "broadphase.h"
+#include "ecs_broadphase.h"
 #include "ecs_math.h"
 #include <stdint.h>
 #include <stdlib.h>

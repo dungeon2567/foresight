@@ -5,7 +5,7 @@
 #include <string.h>
 
 #include "ecs.h"
-#include "input.h"
+#include "ecs_input.h"
 
 /* Reuses g_passed / g_failed / EXPECT / RUN_TEST from test_ecs.h.
    test_ecs.h must be included before this file.

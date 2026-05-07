@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include "broadphase.h"
+#include "ecs_broadphase.h"
 
 /* Reuses g_passed / g_failed / EXPECT / RUN_TEST from test_ecs.h.
    test_ecs.h must be included before this file in the TU.
