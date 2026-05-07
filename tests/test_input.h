@@ -1,0 +1,1660 @@
+#pragma once
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "ecs.h"
+#include "input.h"
+
+/* Reuses g_passed / g_failed / EXPECT / RUN_TEST from test_ecs.h.
+   test_ecs.h must be included before this file.
+
+   Conventions:
+     - Tick 0 is reserved as the "no frontier" sentinel; valid ticks
+       start at 1.
+     - all_confirmed status is computed on demand from current live
+       roster (live_bm) AND confirmed bits.
+     - ecs_input_set has no `expected` parameter; the live roster
+       implicitly defines it.
+     - Frontier is sim-driven. ecs_input_set never advances it; tests
+       call ecs_input_advance_to_tick explicitly to model the sim.
+     - The module is slot-keyed -- ecs_input_alloc_slot returns the
+       slot index; tests use slots directly. Any pid <-> slot mapping
+       lives outside this module. */
+
+typedef struct {
+    uint32_t buttons;
+    int16_t  axis_x;
+    int16_t  axis_y;
+} ti_input_t;   /* 8 bytes */
+
+static inline ti_input_t ti_make(uint32_t b, int16_t x, int16_t y) {
+    ti_input_t v = { b, x, y };
+    return v;
+}
+
+static inline ti_input_t ti_get(const ecs_input_t* it, uint32_t tick, uint32_t slot) {
+    const void* p = ecs_input_get(it, tick, slot);
+    ti_input_t v = {0};
+    if (p) memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static inline bool ti_eq(ti_input_t a, ti_input_t b) {
+    return a.buttons == b.buttons && a.axis_x == b.axis_x && a.axis_y == b.axis_y;
+}
+
+/* Test shims: command-type registry abstracts away from tests by using
+   bit_len as the type id (low 7 bits). All test bit_lens (8,13,16,20,24,
+   32,64) are distinct in those bits so no collision. Auto-registers on
+   first use. */
+static inline void ti_cmd_append(ecs_input_t* it, uint32_t tick, uint32_t slot,
+                                 const void* bytes, uint32_t bit_len) {
+    uint8_t type_id = (uint8_t)(bit_len & 0x7Fu);
+    if (type_id == 0u) return;
+    if (it->cmd_type_bits[type_id] == 0u) {
+        ecs_input_register_command_type(it, type_id, bit_len);
+    }
+    ecs_input_cmd_append(it, tick, slot, type_id, bytes);
+}
+
+static inline bool ti_cmd_iter_next(ecs_input_cmd_iter_t* iter,
+                                    const void** out_bytes, uint32_t* out_bit_len) {
+    uint8_t type;
+    return ecs_input_cmd_iter_next(iter, &type, out_bytes, out_bit_len);
+}
+
+/* For peer round-trips: register all the bit_lens this test file uses
+   on `it` so the deserializer knows payload sizes. Mirrors what
+   ti_cmd_append registers on the sender. */
+static inline void ti_register_test_cmd_types(ecs_input_t* it) {
+    static const uint32_t bls[] = { 8, 13, 16, 20, 24, 32, 64 };
+    for (size_t i = 0; i < sizeof(bls)/sizeof(bls[0]); i++) {
+        uint8_t type_id = (uint8_t)(bls[i] & 0x7Fu);
+        if (it->cmd_type_bits[type_id] == 0u) {
+            ecs_input_register_command_type(it, type_id, bls[i]);
+        }
+    }
+}
+
+/* --- basic set/get roundtrip ------------------------------------------- */
+
+static void test_input_basic_roundtrip(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 64);
+
+    uint32_t s = ecs_input_alloc_slot(&it);
+    EXPECT(s != ECS_INPUT_SLOT_NIL,            "alloc slot ok");
+    EXPECT(ecs_input_active_count(&it) == 1u,  "active count 1 after alloc");
+    EXPECT(ecs_input_slot_is_live(&it, s),     "alloc'd slot reports live");
+
+    ti_input_t v = ti_make(0xABCD, 100, -50);
+    ecs_input_set(&it, 3, s, &v, true);
+
+    EXPECT(ti_eq(ti_get(&it, 3, s), v),        "get returns what set wrote");
+    ecs_input_view_t view = ecs_input_get_view(&it, 3, s);
+    EXPECT(view.data != NULL,                  "view has data ptr");
+    EXPECT(view.present,                       "view marks present");
+    EXPECT(view.confirmed,                     "view marks confirmed");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- get on unknown slot returns NULL ---------------------------------- */
+
+static void test_input_get_unknown(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+
+    EXPECT(ecs_input_get(&it, 1, 0) == NULL,                     "get on dead slot 0 -> NULL");
+    EXPECT(ecs_input_get(&it, 1, 12345) == NULL,                 "get on out-of-range slot -> NULL");
+    ecs_input_view_t v = ecs_input_get_view(&it, 1, 0);
+    EXPECT(v.data == NULL && !v.present && !v.confirmed,         "view dead slot -> empty");
+
+    ti_input_t in = ti_make(1, 2, 3);
+    ecs_input_set(&it, 5, 999, &in, true);
+    EXPECT(ecs_input_get(&it, 5, 999) == NULL,                   "set on dead slot did nothing");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- idempotent confirm (same value, twice) ---------------------------- */
+
+static void test_input_set_idempotent_same_value(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+    uint32_t s1 = ecs_input_alloc_slot(&it);
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+
+    ti_input_t a = ti_make(0x10, 5, 5);
+    ti_input_t b = ti_make(0x20, -1, 1);
+
+    ecs_input_set(&it, 1, s1, &a, true);
+    EXPECT(!ecs_input_tick_confirmed(&it, 1),   "1 of 2 confirmed -> tick not yet confirmed");
+    ecs_input_set(&it, 1, s2, &b, true);
+    EXPECT(ecs_input_tick_confirmed(&it, 1),    "2 of 2 confirmed -> tick confirmed");
+    EXPECT(ecs_input_frontier(&it) == 0ull,     "frontier untouched -- sim drives it");
+
+    /* Replay: must not double-confirm. */
+    ecs_input_set(&it, 1, s1, &a, true);
+    ecs_input_set(&it, 1, s2, &b, true);
+    EXPECT(ecs_input_tick_confirmed(&it, 1),    "tick still confirmed after replay");
+    EXPECT(ti_eq(ti_get(&it, 1, s1), a),        "slot 1 bytes preserved on replay");
+    EXPECT(ti_eq(ti_get(&it, 1, s2), b),        "slot 2 bytes preserved on replay");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- predicted then confirmed (overwrite with new bytes) --------------- */
+
+static void test_input_set_overwrite(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ti_input_t v0 = ti_make(0xAA, 1, 2);
+    ti_input_t v1 = ti_make(0xBB, 9, 9);
+
+    ecs_input_set(&it, 1, s, &v0, false);
+    ecs_input_view_t view = ecs_input_get_view(&it, 1, s);
+    EXPECT(view.present && !view.confirmed,    "predicted set marks present, not confirmed");
+    EXPECT(ti_eq(ti_get(&it, 1, s), v0),       "predicted bytes visible");
+
+    ecs_input_set(&it, 1, s, &v1, true);
+    view = ecs_input_get_view(&it, 1, s);
+    EXPECT(view.confirmed && view.present,     "confirmed set marks both flags");
+    EXPECT(ti_eq(ti_get(&it, 1, s), v1),       "bytes overwritten by confirmed packet");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- multi-packet split, any order ------------------------------------- */
+
+static void test_input_multi_packet_split(void) {
+    const ti_input_t vals[4] = {
+        { 0x1, 1, 1 }, { 0x2, 2, 2 }, { 0x3, 3, 3 }, { 0x4, 4, 4 },
+    };
+
+    ecs_input_t a; ecs_input_init(&a, sizeof(ti_input_t), 16);
+    ecs_input_t b; ecs_input_init(&b, sizeof(ti_input_t), 16);
+    uint32_t sa[4], sb[4];
+    for (int i = 0; i < 4; i++) {
+        sa[i] = ecs_input_alloc_slot(&a);
+        sb[i] = ecs_input_alloc_slot(&b);
+        EXPECT(sa[i] == sb[i],                "slots aligned across peers (parallel allocs)");
+    }
+
+    for (int i = 0; i < 4; i++) ecs_input_set(&a, 1, sa[i], &vals[i], true);
+    for (int i = 3; i >= 0; i--) ecs_input_set(&b, 1, sb[i], &vals[i], true);
+
+    EXPECT(ecs_input_tick_confirmed(&a, 1),   "a: tick confirmed");
+    EXPECT(ecs_input_tick_confirmed(&b, 1),   "b: tick confirmed (reverse order)");
+    for (int i = 0; i < 4; i++) {
+        EXPECT(ti_eq(ti_get(&a, 1, sa[i]), ti_get(&b, 1, sb[i])),
+                                              "per-slot bytes match across orderings");
+    }
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- frontier is sim-driven, not auto-tracked -------------------------- */
+
+static void test_input_frontier_sim_driven(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+    uint32_t s = ecs_input_alloc_slot(&it);
+    ti_input_t v = ti_make(0, 0, 0);
+
+    ecs_input_set(&it, 1, s, &v, true);
+    ecs_input_set(&it, 2, s, &v, true);
+    ecs_input_set(&it, 3, s, &v, true);
+    EXPECT(ecs_input_frontier(&it) == 0ull,    "set never moves frontier");
+
+    /* Sim decides ticks 1..3 are done. */
+    ecs_input_advance_to_tick(&it, 3);
+    EXPECT(ecs_input_frontier(&it) == 3ull,    "advance_to_tick(3) -> frontier 3");
+
+    ecs_input_advance_to_tick(&it, 5);
+    EXPECT(ecs_input_frontier(&it) == 5ull,    "advance is monotonic, can skip ticks");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- past-frontier ticks are vacuously confirmed ----------------------- */
+
+static void test_input_past_frontier_confirmed(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+    uint32_t s1 = ecs_input_alloc_slot(&it);
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+
+    /* Tick 5 partial-confirmed (only s1). Without frontier advance,
+       tick_confirmed must report false. */
+    ti_input_t v = ti_make(0xAA, 1, 1);
+    ecs_input_set(&it, 5, s1, &v, true);
+    EXPECT(!ecs_input_tick_confirmed(&it, 5),    "partial tick: not confirmed pre-frontier");
+
+    /* Sim seals tick 10. Now ticks 1..10 must report confirmed even
+       though s2 was never written and bitmaps disagree. */
+    ecs_input_advance_to_tick(&it, 10);
+    EXPECT(ecs_input_tick_confirmed(&it, 5),     "tick 5 <= frontier: confirmed by seal");
+    EXPECT(ecs_input_tick_confirmed(&it, 10),    "tick 10 == frontier: confirmed");
+    EXPECT(ecs_input_tick_confirmed(&it, 1),     "tick 1 <= frontier: confirmed even if never written");
+    EXPECT(!ecs_input_tick_confirmed(&it, 11),   "tick 11 > frontier: still gated by bitmap");
+
+    /* Evicted slot: write tick 100 -> aliases slot of tick 100 % 8 = 4.
+       Old occupants of any slot whose stored tick <= frontier are evictable.
+       After this write, tick 5 may or may not still be resident depending
+       on slot, but tick_confirmed(5) must still return true since 5 <= frontier. */
+    ti_input_t w = ti_make(0xBB, 2, 2);
+    ecs_input_set(&it, 100, s1, &w, true);
+    ecs_input_set(&it, 100, s2, &w, true);
+    EXPECT(ecs_input_tick_confirmed(&it, 5),     "evicted past-frontier tick still reports confirmed");
+    EXPECT(ecs_input_tick_confirmed(&it, 3),     "never-written past-frontier tick reports confirmed");
+
+    /* Tick 0 is the "no frontier" sentinel and must NOT be claimed confirmed. */
+    EXPECT(!ecs_input_tick_confirmed(&it, 0),    "tick 0 sentinel: not confirmed");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- partial confirm reports tick as not-confirmed --------------------- */
+
+static void test_input_partial_no_advance(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s1 = ecs_input_alloc_slot(&it);
+    (void)ecs_input_alloc_slot(&it);
+
+    ti_input_t v = ti_make(0, 0, 0);
+    ecs_input_set(&it, 1, s1, &v, true);
+
+    EXPECT(!ecs_input_tick_confirmed(&it, 1),  "tick 1 not confirmed -- second slot missing");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- ring wrap: tick T and T+buf_size occupy same slot ----------------- */
+
+static void test_input_ring_wrap(void) {
+    const uint32_t BUF = 8;
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), BUF);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ti_input_t old_v = ti_make(0xDEAD, 1, 1);
+    ti_input_t new_v = ti_make(0xBEEF, 9, 9);
+
+    /* Confirm ticks 1..8; sim then advances frontier past them. */
+    for (uint32_t t = 1; t <= BUF; t++) {
+        ecs_input_set(&it, t, s, &old_v, true);
+    }
+    ecs_input_advance_to_tick(&it, BUF);
+    EXPECT(ecs_input_frontier(&it) == (uint64_t)BUF,
+                                              "frontier == buf_size after sim advance");
+
+    /* Tick 9 aliases slot of tick 1; tick 1 at frontier so safe to evict. */
+    ecs_input_set(&it, BUF + 1u, s, &new_v, true);
+    EXPECT(ti_eq(ti_get(&it, BUF + 1u, s), new_v),
+                                              "wrap: new tick bytes visible");
+    EXPECT(ecs_input_tick_confirmed(&it, BUF + 1u),
+                                              "wrap: new tick confirmed");
+    /* Old tick row was evicted but tick 1 <= frontier, so it is sealed
+       and tick_confirmed reports true (sim authority overrides bitmap). */
+    EXPECT(ecs_input_tick_confirmed(&it, 1),  "wrap: evicted past-frontier tick still confirmed by seal");
+    /* Data eviction is unchanged: ti_get returns NULL because the slot
+       no longer holds tick 1. */
+    EXPECT(ecs_input_get(&it, 1, s) == NULL,  "wrap: evicted tick no longer resident in its slot");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- clear semantics --------------------------------------------------- */
+
+static void test_input_clear(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ti_input_t v = ti_make(7, 7, 7);
+    ecs_input_set(&it, 1, s, &v, true);
+    ecs_input_set(&it, 2, s, &v, true);
+
+    ecs_input_clear(&it, 2);
+    ecs_input_view_t view = ecs_input_get_view(&it, 2, s);
+    EXPECT(!view.present && !view.confirmed,   "after clear: not present");
+    EXPECT(!ecs_input_tick_confirmed(&it, 2),  "after clear: tick not confirmed");
+    EXPECT(ecs_input_frontier(&it) == 0ull,    "clear does NOT touch frontier");
+
+    /* Tick 1 still intact since clear only resets one row. */
+    EXPECT(ti_eq(ti_get(&it, 1, s), v),        "untouched tick survives clear");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- alloc/free cycle: ABA defense ------------------------------------- */
+
+static void test_input_alloc_free_cycle(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+
+    uint32_t s = ecs_input_alloc_slot(&it);
+    EXPECT(s != ECS_INPUT_SLOT_NIL,              "alloc ok");
+    EXPECT(ecs_input_active_count(&it) == 1u,    "active 1 after alloc");
+    EXPECT(ecs_input_slot_is_live(&it, s),       "slot reports live");
+
+    ti_input_t a = ti_make(0xA, 1, 1);
+    ecs_input_set(&it, 1, s, &a, true);
+    EXPECT(ecs_input_tick_confirmed(&it, 1),     "tick 1 confirmed for first owner");
+
+    ecs_input_free_slot(&it, s);
+    EXPECT(ecs_input_active_count(&it) == 0u,    "active 0 after free");
+    EXPECT(!ecs_input_slot_is_live(&it, s),      "freed slot not live");
+
+    /* Free of out-of-range / already-freed slot is a no-op. */
+    ecs_input_free_slot(&it, s);
+    EXPECT(ecs_input_active_count(&it) == 0u,    "double-free is no-op");
+    ecs_input_free_slot(&it, 99999);
+    EXPECT(ecs_input_active_count(&it) == 0u,    "out-of-range free is no-op");
+
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+    EXPECT(s2 == s,                              "second alloc reuses lowest free slot");
+    ecs_input_view_t v = ecs_input_get_view(&it, 1, s2);
+    EXPECT(!v.present,                           "ABA defense: tick 1 not present for new owner");
+    EXPECT(!v.confirmed,                         "ABA defense: tick 1 not confirmed for new owner");
+
+    ti_input_t b = ti_make(0xB, 2, 2);
+    ecs_input_set(&it, 2, s2, &b, true);
+    EXPECT(ti_eq(ti_get(&it, 2, s2), b),         "new-owner bytes visible after reuse");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- determinism: same op stream -> identical state ------------------- */
+
+static void test_input_deterministic_replay(void) {
+    const uint32_t BUF = 32;
+    ecs_input_t a; ecs_input_init(&a, sizeof(ti_input_t), BUF);
+    ecs_input_t b; ecs_input_init(&b, sizeof(ti_input_t), BUF);
+
+    uint32_t sa[3], sb[3];
+    for (int i = 0; i < 3; i++) {
+        sa[i] = ecs_input_alloc_slot(&a);
+        sb[i] = ecs_input_alloc_slot(&b);
+    }
+
+    for (uint32_t t = 1; t <= 5; t++) {
+        for (int i = 0; i < 3; i++) {
+            ti_input_t v = ti_make((uint32_t)(t * 10 + i), (int16_t)t, (int16_t)i);
+            bool conf = ((t + i) & 1u) != 0u;
+            ecs_input_set(&a, t, sa[i], &v, conf);
+            ecs_input_set(&b, t, sb[i], &v, conf);
+        }
+    }
+
+    for (uint32_t t = 1; t <= 5; t++) {
+        for (int i = 0; i < 3; i++) {
+            EXPECT(ti_eq(ti_get(&a, t, sa[i]), ti_get(&b, t, sb[i])),
+                                                "deterministic: bytes match");
+        }
+    }
+    /* Frontier never advances on its own, so both stay 0. */
+    EXPECT(ecs_input_frontier(&a) == 0ull && ecs_input_frontier(&b) == 0ull,
+                                                "deterministic: both frontiers untouched");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- advance_to_tick for mid-session join ------------------------------ */
+
+static void test_input_advance_to_tick(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ecs_input_advance_to_tick(&it, 1000);
+    EXPECT(ecs_input_frontier(&it) == 1000ull, "advance_to_tick(1000) sets frontier");
+
+    ti_input_t v = ti_make(0, 0, 0);
+    ecs_input_set(&it, 1001, s, &v, true);
+    EXPECT(ecs_input_frontier(&it) == 1000ull, "set does not move frontier");
+
+    ecs_input_advance_to_tick(&it, 1001);
+    EXPECT(ecs_input_frontier(&it) == 1001ull, "subsequent advance bumps frontier");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- predicted-after-confirmed dropped --------------------------------- */
+
+static void test_input_predicted_after_confirmed_dropped(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ti_input_t conf_v = ti_make(0xC0, 10, 10);
+    ti_input_t pred_v = ti_make(0xFF, -1, -1);
+
+    ecs_input_set(&it, 2, s, &conf_v, true);
+    EXPECT(ti_eq(ti_get(&it, 2, s), conf_v),    "confirmed bytes recorded");
+
+    ecs_input_set(&it, 2, s, &pred_v, false);
+    EXPECT(ti_eq(ti_get(&it, 2, s), conf_v),    "predicted overwrite dropped");
+    ecs_input_view_t view = ecs_input_get_view(&it, 2, s);
+    EXPECT(view.present && view.confirmed,      "flags unchanged");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- empty roster: tick_confirmed vacuously true ----------------------- */
+
+static void test_input_empty_roster(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+
+    /* No slots allocated -- every tick reports confirmed (vacuous). */
+    EXPECT(ecs_input_tick_confirmed(&it, 1),  "no roster -> tick 1 vacuously confirmed");
+    EXPECT(ecs_input_tick_confirmed(&it, 42), "no roster -> arbitrary tick confirmed");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- iterator visits live slots exactly once -------------------------- */
+
+static void test_input_iterator(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s[5];
+    for (int i = 0; i < 5; i++) s[i] = ecs_input_alloc_slot(&it);
+
+    /* Free middle slot: hole left at s[2]. */
+    ecs_input_free_slot(&it, s[2]);
+
+    ecs_input_iter_t iter = ecs_input_iter_begin(&it);
+    uint32_t seen[8] = {0};
+    int n = 0;
+    while (ecs_input_iter_next(&iter)) {
+        EXPECT(n < 8, "iterator does not exceed expected size");
+        seen[n++] = iter.slot;
+    }
+    EXPECT(n == 4,            "iterator visits 4 live slots");
+    EXPECT(seen[0] == s[0],   "iter[0] == s[0]");
+    EXPECT(seen[1] == s[1],   "iter[1] == s[1]");
+    EXPECT(seen[2] == s[3],   "iter[2] == s[3]");
+    EXPECT(seen[3] == s[4],   "iter[3] == s[4]");
+
+    EXPECT(ecs_input_slot_is_live(&it, s[0]),    "s[0] live");
+    EXPECT(!ecs_input_slot_is_live(&it, s[2]),   "s[2] not live after free");
+    EXPECT(!ecs_input_slot_is_live(&it, 999),    "out-of-range slot not live");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- player cap auto-grow --------------------------------------------- */
+
+static void test_input_player_cap(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+
+    EXPECT(it.active_cap == 0u, "active_cap starts at 0 (lazy alloc)");
+
+    /* Alloc 17 slots: forces grow past initial 16. */
+    uint32_t slots[17];
+    for (uint32_t i = 0; i < 17u; i++) {
+        slots[i] = ecs_input_alloc_slot(&it);
+        EXPECT(slots[i] != ECS_INPUT_SLOT_NIL,  "alloc grows player cap pow2");
+    }
+    EXPECT(it.active_cap >= 32u,               "active_cap doubled past 16");
+    EXPECT(ecs_input_active_count(&it) == 17u, "active count tracks allocs");
+
+    ecs_input_grow_player_cap(&it, 128);
+    EXPECT(it.active_cap >= 128u,              "preemptive grow rounds to >= request");
+
+    uint32_t cap_before = it.active_cap;
+    ecs_input_grow_player_cap(&it, 32);
+    EXPECT(it.active_cap == cap_before,        "below-current grow is no-op");
+
+    ti_input_t v = ti_make(0xCAFE, 7, 7);
+    ecs_input_set(&it, 1, slots[5], &v, true);
+    EXPECT(ti_eq(ti_get(&it, 1, slots[5]), v), "set/get works after grow");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- input persistence: predicted carries forward --------------------- */
+
+static void test_input_persistence(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+    uint32_t s1 = ecs_input_alloc_slot(&it);
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+
+    ti_input_t a = ti_make(0xA, 1, 1);
+    ti_input_t b = ti_make(0xB, 2, 2);
+
+    /* Confirm tick 1 for both slots. */
+    ecs_input_set(&it, 1, s1, &a, true);
+    ecs_input_set(&it, 1, s2, &b, true);
+    EXPECT(ecs_input_tick_confirmed(&it, 1),   "tick 1 confirmed");
+
+    /* Predict tick 2 for s1 only; s2's prev bytes (b) carry forward
+       as predicted via advance_row. */
+    ti_input_t a2 = ti_make(0xAA, 5, 5);
+    ecs_input_set(&it, 2, s1, &a2, false);
+
+    EXPECT(ti_eq(ti_get(&it, 2, s1), a2),      "s1 predicted bytes");
+    EXPECT(ti_eq(ti_get(&it, 2, s2), b),       "s2 bytes carried from tick 1");
+    ecs_input_view_t v2 = ecs_input_get_view(&it, 2, s2);
+    EXPECT(v2.present && !v2.confirmed,        "carried bytes marked predicted");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- out-of-order arrival: backward predicted walk -------------------- */
+
+static void test_input_ooo_backward_fill(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    /* Tick 5 arrives first, no prior history. Backfill must imprint
+       v at ticks 4,3,2,1 as predicted (not confirmed). */
+    ti_input_t v = ti_make(0xAB, 7, 7);
+    ecs_input_set(&it, 5, s, &v, true);
+
+    for (uint32_t t = 1; t <= 4; t++) {
+        ecs_input_view_t view = ecs_input_get_view(&it, t, s);
+        EXPECT(view.present,                "OOO backfill: past tick has slot present");
+        EXPECT(!view.confirmed,             "OOO backfill: past tick predicted only");
+        EXPECT(ti_eq(ti_get(&it, t, s), v), "OOO backfill: bytes match current");
+    }
+    ecs_input_view_t at5 = ecs_input_get_view(&it, 5, s);
+    EXPECT(at5.present && at5.confirmed,    "OOO backfill: source tick still confirmed");
+
+    /* Already-present blocks further backfill. Tick 10 arrives: walk
+       9,8,7,6 (all NIL -> claim + write w predicted), then T=5 is
+       present -> stop. Tick 5 must NOT be overwritten. */
+    ti_input_t w = ti_make(0xCD, 1, 1);
+    ecs_input_set(&it, 10, s, &w, true);
+    for (uint32_t t = 6; t <= 9; t++) {
+        ecs_input_view_t view = ecs_input_get_view(&it, t, s);
+        EXPECT(view.present && !view.confirmed, "OOO backfill: predicted in gap");
+        EXPECT(ti_eq(ti_get(&it, t, s), w),     "OOO backfill: gap bytes match w");
+    }
+    EXPECT(ti_eq(ti_get(&it, 5, s), v),         "OOO backfill: tick 5 not overwritten");
+    ecs_input_view_t at5b = ecs_input_get_view(&it, 5, s);
+    EXPECT(at5b.confirmed,                      "OOO backfill: tick 5 still confirmed");
+
+    /* Frontier blocks backfill below it. Advance frontier to 12, set
+       tick 20: walk 19..13 fills predicted z, T=12 <= frontier stops. */
+    ecs_input_advance_to_tick(&it, 12);
+    ti_input_t z = ti_make(0xEF, 2, 2);
+    ecs_input_set(&it, 20, s, &z, true);
+    for (uint32_t t = 13; t <= 19; t++) {
+        ecs_input_view_t view = ecs_input_get_view(&it, t, s);
+        EXPECT(view.present && !view.confirmed, "OOO backfill: predicted above frontier");
+        EXPECT(ti_eq(ti_get(&it, t, s), z),     "OOO backfill: above-frontier bytes match z");
+    }
+    /* Frontier seal: tick 12 was never written; ring slot is NIL or
+       holds an unrelated tick. get must return NULL (not resident). */
+    EXPECT(ecs_input_get(&it, 12, s) == NULL,   "OOO backfill: frontier sealed tick not touched");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- auto-grow on burst of predictions -------------------------------- */
+
+static void test_input_auto_grow_burst(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    /* Predict 600 ticks. Frontier stays 0 (no confirm), so every aliased
+       slot is "live" -> auto-grow fires. */
+    ti_input_t pred_v[600];
+    for (uint32_t t = 1; t <= 600; t++) {
+        pred_v[t-1] = ti_make((uint32_t)(t * 7u), (int16_t)t, (int16_t)(t & 0xff));
+        ecs_input_set(&it, t, s, &pred_v[t-1], false);
+    }
+
+    EXPECT(it.buf_size >= 1024u,
+                                              "ring grew to >= 1024 during 600-tick predict burst");
+    EXPECT(ti_eq(ti_get(&it, 1, s), pred_v[0]),
+                                              "tick 1 predicted bytes preserved");
+    EXPECT(ti_eq(ti_get(&it, 600, s), pred_v[599]),
+                                              "tick 600 predicted bytes preserved");
+
+    /* Confirmed burst, then sim advances frontier. */
+    for (uint32_t t = 1; t <= 600; t++) {
+        ti_input_t v = ti_make((uint32_t)t, (int16_t)t, 0);
+        ecs_input_set(&it, t, s, &v, true);
+    }
+    ecs_input_advance_to_tick(&it, 600);
+    EXPECT(ecs_input_frontier(&it) == 600ull,
+                                              "sim advanced frontier to 600");
+
+    /* All 600 ticks must report confirmed and yield the confirm-pass bytes
+       (NOT the earlier predicted bytes). */
+    bool all_conf = true;
+    bool all_bytes = true;
+    bool no_pred_leak = true;
+    for (uint32_t t = 1; t <= 600; t++) {
+        if (!ecs_input_tick_confirmed(&it, t)) { all_conf = false; break; }
+        ti_input_t expect_v = ti_make((uint32_t)t, (int16_t)t, 0);
+        ti_input_t got = ti_get(&it, t, s);
+        if (!ti_eq(got, expect_v))      { all_bytes = false; break; }
+        if (ti_eq(got, pred_v[t-1]))    { no_pred_leak = false; break; }
+    }
+    EXPECT(all_conf,                          "every tick 1..600 reports confirmed");
+    EXPECT(all_bytes,                         "every tick 1..600 returns confirm-pass bytes");
+    EXPECT(no_pred_leak,                      "predicted bytes overwritten by confirm pass");
+
+    /* view flags consistent on a spot-check tick. */
+    ecs_input_view_t mid = ecs_input_get_view(&it, 300, s);
+    EXPECT(mid.present && mid.confirmed,      "mid-burst view: present + confirmed");
+    EXPECT(mid.data != NULL,                  "mid-burst view: data ptr non-null");
+
+    /* Frontier must be untouched by all the prior set() calls. */
+    EXPECT(ecs_input_frontier(&it) == 600ull, "frontier still 600 (set never moves it)");
+
+    /* Past-frontier write into a slot whose old tick is now <= frontier
+       must succeed without further ring growth. tick 700 aliases slot of
+       tick (700 % buf_size); old occupant is evictable. */
+    uint32_t buf_before = it.buf_size;
+    ti_input_t fresh = ti_make(0xFEEDF00Du, 1234, -1234);
+    ecs_input_set(&it, 700, s, &fresh, true);
+    EXPECT(it.buf_size == buf_before,         "no extra grow when victim slot <= frontier");
+    EXPECT(ti_eq(ti_get(&it, 700, s), fresh), "tick 700 confirmed bytes visible");
+    EXPECT(ecs_input_tick_confirmed(&it, 700),"tick 700 reports confirmed");
+
+    /* Old tick whose ring slot was just stolen is no longer the row's
+       resident -- ti_get returns NULL because tick_in_slot != requested. */
+    uint64_t evicted = 700ull - (uint64_t)it.buf_size;
+    if (evicted >= 1ull && evicted <= 600ull) {
+        EXPECT(ecs_input_get(&it, evicted, s) == NULL,
+                                              "evicted tick no longer resident in its slot");
+    }
+
+    ecs_input_destroy(&it);
+}
+
+/* --- ecs_input_grow_buf preemptive ----------------------------------- */
+
+static void test_input_grow_buf_preemptive(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 4);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ecs_input_grow_buf(&it, 64);
+    EXPECT(it.buf_size == 64u, "preemptive grow rounds to pow2 >= request");
+
+    ecs_input_grow_buf(&it, 8);
+    EXPECT(it.buf_size == 64u, "below-current grow is no-op");
+
+    ti_input_t v = ti_make(0x1234, 1, 1);
+    ecs_input_set(&it, 50, s, &v, true);
+    EXPECT(ti_eq(ti_get(&it, 50, s), v), "tick 50 set/get works in grown ring");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- grow consistency: active_cap (player dimension) ------------------ */
+
+static void test_input_grow_player_cap_consistency(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+
+    uint32_t slots[5];
+    for (int i = 0; i < 5; i++) slots[i] = ecs_input_alloc_slot(&it);
+
+    EXPECT(it.active_cap == 16u, "initial cap is ECS_INPUT_PLAYER_CAP_INIT (16)");
+
+    /* Populate ticks 1..4 with mixed predicted/confirmed. Tick 3 is
+       intentionally partial so tick_confirmed must report false. */
+    ti_input_t snap_data[4][5];
+    bool snap_present[4][5];
+    bool snap_confirmed[4][5];
+    bool snap_tick_conf[4];
+
+    for (uint32_t t = 1; t <= 4; t++) {
+        bool all_conf = true;
+        for (int i = 0; i < 5; i++) {
+            ti_input_t v = ti_make((uint32_t)(t * 100u + i),
+                                   (int16_t)(t + i), (int16_t)(t * i));
+            bool conf = !(t == 3 && i >= 3);
+            ecs_input_set(&it, t, slots[i], &v, conf);
+            snap_data[t-1][i]      = v;
+            snap_present[t-1][i]   = true;
+            snap_confirmed[t-1][i] = conf;
+            if (!conf) all_conf = false;
+        }
+        snap_tick_conf[t-1] = all_conf;
+    }
+
+    /* Sanity on snapshot itself before any grow. */
+    for (uint32_t t = 1; t <= 4; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "snapshot: tick_confirmed matches expected");
+    }
+
+    /* Grow active_cap: triggers row-width realloc + per-row remap. */
+    ecs_input_grow_player_cap(&it, 64);
+    EXPECT(it.active_cap == 64u,                  "active_cap grown to 64");
+
+    for (uint32_t t = 1; t <= 4; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across active_cap grow");
+        for (int i = 0; i < 5; i++) {
+            ecs_input_view_t v = ecs_input_get_view(&it, t, slots[i]);
+            EXPECT(v.present   == snap_present[t-1][i],
+                                                  "view.present preserved across active_cap grow");
+            EXPECT(v.confirmed == snap_confirmed[t-1][i],
+                                                  "view.confirmed preserved across active_cap grow");
+            EXPECT(ti_eq(ti_get(&it, t, slots[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across active_cap grow");
+        }
+    }
+
+    /* Second grow: re-runs the same remap with already-grown layout. */
+    ecs_input_grow_player_cap(&it, 256);
+    EXPECT(it.active_cap == 256u,                 "active_cap grown to 256");
+    for (uint32_t t = 1; t <= 4; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across second grow");
+        for (int i = 0; i < 5; i++) {
+            EXPECT(ti_eq(ti_get(&it, t, slots[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across second grow");
+        }
+    }
+
+    /* Alloc a new slot post-grow; must not disturb prior state. */
+    uint32_t fresh_s = ecs_input_alloc_slot(&it);
+    EXPECT(fresh_s != ECS_INPUT_SLOT_NIL,         "alloc new slot after grow");
+    ti_input_t fresh = ti_make(0xFEED, 5, 5);
+    ecs_input_set(&it, 5, fresh_s, &fresh, true);
+    EXPECT(ti_eq(ti_get(&it, 5, fresh_s), fresh), "new-slot bytes visible after alloc-post-grow");
+    for (int i = 0; i < 5; i++) {
+        EXPECT(ti_eq(ti_get(&it, 1, slots[i]), snap_data[0][i]),
+                                                  "old-slot data intact after new-slot alloc");
+    }
+
+    ecs_input_destroy(&it);
+}
+
+/* --- grow consistency: buf_size (ring dimension) ----------------------- */
+
+static void test_input_grow_buf_consistency(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+
+    uint32_t slots[3];
+    for (int i = 0; i < 3; i++) slots[i] = ecs_input_alloc_slot(&it);
+
+    /* Fill entire ring (ticks 1..8). Frontier stays at 0 so every slot
+       counts as "live" — auto-grow on first-touch must NOT be triggered
+       inside this loop because we only write within the existing ring. */
+    ti_input_t snap_data[8][3];
+    bool snap_present[8][3];
+    bool snap_confirmed[8][3];
+    bool snap_tick_conf[8];
+
+    for (uint32_t t = 1; t <= 8; t++) {
+        bool all_conf = true;
+        for (int i = 0; i < 3; i++) {
+            ti_input_t v = ti_make((uint32_t)(t * 11u + i),
+                                   (int16_t)(t * 2), (int16_t)(i + 1));
+            bool conf = !(t == 5 && i == 2);   /* tick 5 partial-confirmed */
+            ecs_input_set(&it, t, slots[i], &v, conf);
+            snap_data[t-1][i]      = v;
+            snap_present[t-1][i]   = true;
+            snap_confirmed[t-1][i] = conf;
+            if (!conf) all_conf = false;
+        }
+        snap_tick_conf[t-1] = all_conf;
+    }
+
+    EXPECT(it.buf_size == 8u,                     "ring at original size before grow");
+
+    /* Grow buf_size: triggers row-count realloc + per-row remap under wider mask. */
+    ecs_input_grow_buf(&it, 32);
+    EXPECT(it.buf_size == 32u,                    "ring grown to 32");
+
+    /* All ticks 1..8 still readable; their slot indices changed only
+       for tick 8 (old slot 0, new slot 8) but content must be identical. */
+    for (uint32_t t = 1; t <= 8; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across buf_size grow");
+        for (int i = 0; i < 3; i++) {
+            ecs_input_view_t v = ecs_input_get_view(&it, t, slots[i]);
+            EXPECT(v.present   == snap_present[t-1][i],
+                                                  "view.present preserved across buf_size grow");
+            EXPECT(v.confirmed == snap_confirmed[t-1][i],
+                                                  "view.confirmed preserved across buf_size grow");
+            EXPECT(ti_eq(ti_get(&it, t, slots[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across buf_size grow");
+        }
+    }
+
+    /* Second grow. */
+    ecs_input_grow_buf(&it, 128);
+    EXPECT(it.buf_size == 128u,                   "ring grown to 128");
+    for (uint32_t t = 1; t <= 8; t++) {
+        EXPECT(ecs_input_tick_confirmed(&it, t) == snap_tick_conf[t-1],
+                                                  "tick_confirmed preserved across second grow");
+        for (int i = 0; i < 3; i++) {
+            EXPECT(ti_eq(ti_get(&it, t, slots[i]), snap_data[t-1][i]),
+                                                  "bytes preserved across second grow");
+        }
+    }
+
+    /* Far-future write into newly available slots works. */
+    ti_input_t v = ti_make(0xDADA, 9, 9);
+    ecs_input_set(&it, 100, slots[0], &v, true);
+    EXPECT(ti_eq(ti_get(&it, 100, slots[0]), v),  "post-grow far-tick write works");
+    /* Old data still intact. */
+    for (uint32_t t = 1; t <= 8; t++) {
+        for (int i = 0; i < 3; i++) {
+            EXPECT(ti_eq(ti_get(&it, t, slots[i]), snap_data[t-1][i]),
+                                                  "old data intact after far-tick write");
+        }
+    }
+
+    ecs_input_destroy(&it);
+}
+
+/* --- grow consistency: combined (cap then buf) ------------------------- */
+
+static void test_input_grow_combined_consistency(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+
+    uint32_t slots[4];
+    for (int i = 0; i < 4; i++) slots[i] = ecs_input_alloc_slot(&it);
+
+    ti_input_t snap_data[6][4];
+    bool snap_confirmed[6][4];
+    for (uint32_t t = 1; t <= 6; t++) {
+        for (int i = 0; i < 4; i++) {
+            ti_input_t v = ti_make((uint32_t)(t * 1000u + i * 7u),
+                                   (int16_t)(t - i), (int16_t)(t + i));
+            bool conf = ((t + i) & 1u) == 0u;
+            ecs_input_set(&it, t, slots[i], &v, conf);
+            snap_data[t-1][i] = v;
+            snap_confirmed[t-1][i] = conf;
+        }
+    }
+
+    /* Interleaved grows on both axes. */
+    ecs_input_grow_player_cap(&it, 64);
+    ecs_input_grow_buf(&it, 64);
+    ecs_input_grow_player_cap(&it, 128);
+    ecs_input_grow_buf(&it, 256);
+
+    for (uint32_t t = 1; t <= 6; t++) {
+        for (int i = 0; i < 4; i++) {
+            ecs_input_view_t v = ecs_input_get_view(&it, t, slots[i]);
+            EXPECT(v.present,                     "present preserved through combined grows");
+            EXPECT(v.confirmed == snap_confirmed[t-1][i],
+                                                  "confirmed preserved through combined grows");
+            EXPECT(ti_eq(ti_get(&it, t, slots[i]), snap_data[t-1][i]),
+                                                  "bytes preserved through combined grows");
+        }
+    }
+
+    ecs_input_destroy(&it);
+}
+
+/* --- serialize/deserialize round-trip --------------------------------- */
+
+static void test_input_serialize_roundtrip(void) {
+    /* Two peers. Mirror past ticks so cascade refs resolve identically
+       on both sides. Slots aligned via parallel allocs. */
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+
+    uint32_t sa[4], sb[4];
+    for (int i = 0; i < 4; i++) {
+        sa[i] = ecs_input_alloc_slot(&a);
+        sb[i] = ecs_input_alloc_slot(&b);
+        EXPECT(sa[i] == sb[i],                "slots aligned across peers");
+    }
+
+    ti_input_t v1 = ti_make(0xAA, 1, 1);
+    ti_input_t v2 = ti_make(0xBB, 2, 2);
+    ti_input_t v3 = ti_make(0xCC, 3, 3);
+    ti_input_t v4 = ti_make(0xDD, 4, 4);
+
+    /* Both peers know tick 10. */
+    ti_input_t* vs[4] = { &v1, &v2, &v3, &v4 };
+    for (int i = 0; i < 4; i++) {
+        ecs_input_set(&a, 10, sa[i], vs[i], true);
+        ecs_input_set(&b, 10, sb[i], vs[i], true);
+    }
+
+    /* Tick 11 on sender:
+         slot 0: same as tick 10  -> cascade match (1+1 bit)
+         slot 1: zero              -> baseline match (1 bit)
+         slot 2: new payload       -> all-1 bits + raw stride bytes
+         slot 3: same as tick 10   -> cascade match (1+1 bit). */
+    ti_input_t zero = ti_make(0, 0, 0);
+    ti_input_t v3b  = ti_make(0xCAFEu, -100, 200);
+    ecs_input_set(&a, 11, sa[0], &v1,   true);
+    ecs_input_set(&a, 11, sa[1], &zero, true);
+    ecs_input_set(&a, 11, sa[2], &v3b,  true);
+    ecs_input_set(&a, 11, sa[3], &v4,   true);
+
+    uint64_t buf[64] = {0};
+    ecs_serializer_t s;
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 11, 8, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+    int32_t bits_written = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits_written > 0,                  "serializer wrote some bits");
+
+    ecs_deserializer_t d;
+    ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+
+    EXPECT(ti_eq(ti_get(&b, 11, sb[0]), v1),  "slot 0: cascade-match round-trip");
+    EXPECT(ti_eq(ti_get(&b, 11, sb[1]), zero),"slot 1: baseline-match round-trip");
+    EXPECT(ti_eq(ti_get(&b, 11, sb[2]), v3b), "slot 2: raw-payload round-trip");
+    EXPECT(ti_eq(ti_get(&b, 11, sb[3]), v4),  "slot 3: cascade-match round-trip");
+
+    /* Deserialized tick must be marked confirmed (per spec). */
+    for (int i = 0; i < 4; i++) {
+        ecs_input_view_t v = ecs_input_get_view(&b, 11, sb[i]);
+        EXPECT(v.present && v.confirmed,      "deserialized slot: present + confirmed");
+    }
+    EXPECT(ecs_input_tick_confirmed(&b, 11),  "tick fully confirmed after deserialize");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- serialize: redundancy=0 (just baseline vs raw) ------------------- */
+
+static void test_input_serialize_redundancy_zero(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 16);
+    ecs_input_init(&b, sizeof(ti_input_t), 16);
+    uint32_t sa = ecs_input_alloc_slot(&a);
+    uint32_t sb = ecs_input_alloc_slot(&b);
+    EXPECT(sa == sb,                          "slots aligned");
+
+    ti_input_t v = ti_make(0xBEEFu, 7, 7);
+    ecs_input_set(&a, 5, sa, &v, true);
+
+    uint64_t buf[16] = {0};
+    ecs_serializer_t s;   ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 5, 0, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d; ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+
+    EXPECT(ti_eq(ti_get(&b, 5, sb), v),       "redundancy=0: raw round-trip");
+    EXPECT(ecs_input_tick_confirmed(&b, 5),   "tick 5 confirmed on receiver");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- serialize: all-zero tick compresses to 1 bit per slot ------------ */
+
+static void test_input_serialize_all_zero_compact(void) {
+    ecs_input_t it;
+    ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t slots[5];
+    for (int i = 0; i < 5; i++) slots[i] = ecs_input_alloc_slot(&it);
+
+    ti_input_t z = ti_make(0, 0, 0);
+    for (int i = 0; i < 5; i++) ecs_input_set(&it, 1, slots[i], &z, true);
+
+    uint64_t buf[16] = {0};
+    ecs_serializer_t s;
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&it, &s, 1, 3, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+
+    int32_t bits = ecs_serializer_get_bits_written(&s);
+    /* Header: 46 bits. All 16 slots are empty (zero values, no cmds);
+       each emits 1 any_data gate bit = 0. Total = 46 + 16 = 62 bits. */
+    EXPECT(bits == 62,                        "all-zero tick: header(46) + 16 empty gates = 62 bits");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- serialize: dead slot columns consume bits but don't apply -------- */
+
+static void test_input_serialize_unregistered_skipped(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 16);
+    ecs_input_init(&b, sizeof(ti_input_t), 16);
+
+    /* Sender allocs 3 slots. Receiver allocs 2 then frees the second
+       and re-allocs once more, leaving slot index 1 dead and slot 2
+       live -- but we want sender's slot 2 to be dead on receiver. So
+       receiver allocs slot 0, slot 1, then nothing else; sender allocs
+       slot 0, 1, 2. b's active_cap stays 16 after first alloc on b. */
+    uint32_t sa0 = ecs_input_alloc_slot(&a);
+    uint32_t sa1 = ecs_input_alloc_slot(&a);
+    uint32_t sa2 = ecs_input_alloc_slot(&a);
+    uint32_t sb0 = ecs_input_alloc_slot(&b);
+    uint32_t sb1 = ecs_input_alloc_slot(&b);
+    EXPECT(sa0 == sb0 && sa1 == sb1,           "slots 0,1 aligned");
+    EXPECT(sa2 == 2u,                          "sender slot 2 == 2");
+    EXPECT(!ecs_input_slot_is_live(&b, 2),     "receiver slot 2 not live");
+
+    ti_input_t v1 = ti_make(0x11u, 1, 1);
+    ti_input_t v2 = ti_make(0x22u, 2, 2);
+    ti_input_t v3 = ti_make(0x33u, 3, 3);
+    ecs_input_set(&a, 1, sa0, &v1, true);
+    ecs_input_set(&a, 1, sa1, &v2, true);
+    ecs_input_set(&a, 1, sa2, &v3, true);
+
+    uint64_t buf[16] = {0};
+    ecs_serializer_t s;   ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 1, 0, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d; ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+
+    EXPECT(ti_eq(ti_get(&b, 1, sb0), v1),     "slot 0 applied on receiver");
+    EXPECT(ti_eq(ti_get(&b, 1, sb1), v2),     "slot 1 applied on receiver");
+    EXPECT(ecs_input_get(&b, 1, 2) == NULL,   "slot 2 not on receiver -- dead");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- serialize: redundancy=8 wire size per cascade level -------------- */
+
+static void test_input_serialize_redundancy_eight(void) {
+    /* 1 allocated slot -> active_cap = 16 (init grow). Header = 46 bits.
+       Per slot: 1 any_data gate bit. If 0, empty (1 bit total).
+       If 1, body follows: 9 * (1 diff + diff?stride*8:0) + 9 * (1 cmd gate
+       + cmd payload). 15 dead slots = 15 empty gates = 15 bits.
+       Packet = 46 + (1 + slot0_body) + 15. */
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+    uint32_t sa = ecs_input_alloc_slot(&a);
+    uint32_t sb = ecs_input_alloc_slot(&b);
+    EXPECT(sa == sb,                          "slots aligned");
+
+    /* Mirror ticks 1..9 on both peers, all distinct payloads. */
+    ti_input_t vs[10];
+    vs[0] = ti_make(0, 0, 0);   /* unused, tick 0 reserved */
+    for (uint32_t t = 1; t <= 9; t++) {
+        vs[t] = ti_make((uint32_t)(t * 0x1111u), (int16_t)t, (int16_t)(-(int)t));
+        ecs_input_set(&a, t, sa, &vs[t], true);
+        ecs_input_set(&b, t, sb, &vs[t], true);
+    }
+
+    uint64_t buf[16];
+    ecs_serializer_t s;
+    ecs_deserializer_t d;
+    int32_t bits;
+
+    /* (A) Unique at T=10. Slot 0 cascade body = 9 diff=1 + 9*64 raw
+       + 9 cmd gates = 594. With any_data=1 leading: 595. 15 dead =
+       15 empty gates. Total = 46 + 595 + 15 = 656 bits. */
+    ti_input_t unique = ti_make(0xDEADBEEFu, 999, -999);
+    ecs_input_set(&a, 10, sa, &unique, true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 10, 8, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 656,                       "redundancy=8 all-distinct cascade: 656 bits");
+
+    ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 10, sb), unique), "redundancy=8 unique: round-trip");
+
+    /* (B) T=11 with same value as T=10 (unique). Cascade 11..3.
+       Bits (newest first): t=11 vs baseline =1 +raw, t=10 vs prev=unique
+       =0 (match), t=9 vs unique =1 +raw, t=8..3 each vs prev =1 +raw.
+       Diffs: 1,0,1,1,1,1,1,1,1 = 8 ones. 9 + 8*64 raw + 9 cmd = 530 body.
+       Slot wire = 1 + 530 = 531. 15 empty gates. Total = 46 + 531 + 15 = 592. */
+    ecs_input_set(&a, 11, sa, &unique, true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 11, 8, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 592,                       "redundancy=8 single match in cascade: 592 bits");
+
+    ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 11, sb), unique), "redundancy=8 T-1 match: round-trip");
+
+    /* (C) T=12 with value vs[4]. Cascade 12..4. Sender ring has
+       11=unique, 10=unique, 9..4 = vs[9..4].
+       Bits: 12 vs 0=1+raw, 11 vs vs[4]=1+raw, 10 vs unique=0,
+       9 vs unique=1+raw, 8..4 each vs prev=1+raw each.
+       Diffs: 1,1,0,1,1,1,1,1,1 = 8 ones. Body = 530. Slot wire = 531.
+       15 empty gates. Total = 46 + 531 + 15 = 592 bits. */
+    ecs_input_set(&a, 12, sa, &vs[4], true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 12, 8, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 592,                       "redundancy=8 mid-cascade match: 592 bits");
+
+    ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 12, sb), vs[4]),  "redundancy=8 T-8 match: round-trip");
+
+    /* (D) T=13 with zero value. Cascade 13..5. Sender ring has
+       12=vs[4], 11=unique, 10=unique, 9..5 = vs[9..5].
+       Bits: 13 vs 0=0, 12 vs 0=1+raw, 11 vs vs[4]=1+raw, 10 vs unique=0,
+       9 vs unique=1+raw, 8..5 each vs prev=1+raw.
+       Diffs: 0,1,1,0,1,1,1,1,1 = 7 ones, 2 zeros. 9 + 7*64 + 9 cmd = 466 body.
+       Slot wire = 1 + 466 = 467. 15 empty gates. Total = 46 + 467 + 15 = 528. */
+    ti_input_t zero = ti_make(0, 0, 0);
+    ecs_input_set(&a, 13, sa, &zero, true);
+
+    memset(buf, 0, sizeof(buf));
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 13, 8, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+    bits = ecs_serializer_get_bits_written(&s);
+    EXPECT(bits == 528,                       "redundancy=8 baseline lead + mid match: 528 bits");
+
+    ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+    EXPECT(ti_eq(ti_get(&b, 13, sb), zero),   "redundancy=8 baseline match: round-trip");
+
+    /* Sanity: across all four scenarios receiver tick is fully confirmed. */
+    EXPECT(ecs_input_tick_confirmed(&b, 10),  "tick 10 confirmed on receiver");
+    EXPECT(ecs_input_tick_confirmed(&b, 11),  "tick 11 confirmed on receiver");
+    EXPECT(ecs_input_tick_confirmed(&b, 12),  "tick 12 confirmed on receiver");
+    EXPECT(ecs_input_tick_confirmed(&b, 13),  "tick 13 confirmed on receiver");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- command stream: basic append + iter FIFO ------------------------- */
+
+static void test_input_cmd_basic_fifo(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    /* Empty: iter returns false. */
+    ecs_input_cmd_iter_t iter0 = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p0 = NULL; uint32_t bl0 = 0;
+    EXPECT(!ti_cmd_iter_next(&iter0, &p0, &bl0),
+                                            "empty (no row resident): iter exhausted");
+
+    /* Append three commands of distinct sizes. */
+    uint32_t v0 = 0xDEADBEEFu;            /* 32 bits */
+    uint64_t v1 = 0x0123456789ABCDEFull;  /* 64 bits */
+    uint8_t  v2[3] = { 0xAB, 0xCD, 0x12 };/* 24 bits */
+    ti_cmd_append(&it, 1, s, &v0, 32);
+    ti_cmd_append(&it, 1, s, &v1, 64);
+    ti_cmd_append(&it, 1, s, v2, 24);
+
+    /* FIFO: visit in append order. */
+    ecs_input_cmd_iter_t iter = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p = NULL; uint32_t bl = 0;
+
+    EXPECT(ti_cmd_iter_next(&iter, &p, &bl), "iter[0] yields");
+    EXPECT(bl == 32u, "iter[0]: bit_len 32");
+    EXPECT(p && memcmp(p, &v0, 4) == 0, "iter[0]: bytes match v0");
+
+    EXPECT(ti_cmd_iter_next(&iter, &p, &bl), "iter[1] yields");
+    EXPECT(bl == 64u, "iter[1]: bit_len 64");
+    EXPECT(p && memcmp(p, &v1, 8) == 0, "iter[1]: bytes match v1");
+
+    EXPECT(ti_cmd_iter_next(&iter, &p, &bl), "iter[2] yields");
+    EXPECT(bl == 24u, "iter[2]: bit_len 24");
+    EXPECT(p && memcmp(p, v2, 3) == 0, "iter[2]: bytes match v2");
+
+    EXPECT(!ti_cmd_iter_next(&iter, &p, &bl), "iter exhausted after 3");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: per-slot independence ----------------------------- */
+
+static void test_input_cmd_multi_slot_fifo(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s0 = ecs_input_alloc_slot(&it);
+    uint32_t s1 = ecs_input_alloc_slot(&it);
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+
+    /* Interleaved appends across slots; each slot must keep its own
+       FIFO order. */
+    uint32_t a[2] = { 0x1111u, 0x2222u };  /* slot 0 */
+    uint32_t b[3] = { 0xAAAAu, 0xBBBBu, 0xCCCCu };  /* slot 1 */
+    /* slot 2: no commands */
+
+    ti_cmd_append(&it, 7, s1, &b[0], 16);
+    ti_cmd_append(&it, 7, s0, &a[0], 16);
+    ti_cmd_append(&it, 7, s1, &b[1], 16);
+    ti_cmd_append(&it, 7, s0, &a[1], 16);
+    ti_cmd_append(&it, 7, s1, &b[2], 16);
+
+    /* slot 0 FIFO: a[0], a[1]. */
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&it, 7, s0);
+    const void* p; uint32_t bl;
+    EXPECT(ti_cmd_iter_next(&i0, &p, &bl) && bl == 16u && memcmp(p, &a[0], 2) == 0,
+                                            "s0 iter[0] = a[0]");
+    EXPECT(ti_cmd_iter_next(&i0, &p, &bl) && bl == 16u && memcmp(p, &a[1], 2) == 0,
+                                            "s0 iter[1] = a[1]");
+    EXPECT(!ti_cmd_iter_next(&i0, &p, &bl), "s0 exhausted");
+
+    /* slot 1 FIFO: b[0], b[1], b[2]. */
+    ecs_input_cmd_iter_t i1 = ecs_input_cmd_iter_begin(&it, 7, s1);
+    EXPECT(ti_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &b[0], 2) == 0,
+                                            "s1 iter[0] = b[0]");
+    EXPECT(ti_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &b[1], 2) == 0,
+                                            "s1 iter[1] = b[1]");
+    EXPECT(ti_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &b[2], 2) == 0,
+                                            "s1 iter[2] = b[2]");
+    EXPECT(!ti_cmd_iter_next(&i1, &p, &bl), "s1 exhausted");
+
+    /* slot 2 empty. */
+    ecs_input_cmd_iter_t i2 = ecs_input_cmd_iter_begin(&it, 7, s2);
+    EXPECT(!ti_cmd_iter_next(&i2, &p, &bl), "s2 empty (no commands)");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: ring wrap evicts commands ------------------------- */
+
+static void test_input_cmd_first_touch_reset(void) {
+    const uint32_t BUF = 8;
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), BUF);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v_old = 0x11111111u;
+    uint32_t v_new = 0x22222222u;
+
+    /* tick 1 commands. */
+    ti_cmd_append(&it, 1, s, &v_old, 32);
+    ti_cmd_append(&it, 1, s, &v_old, 32);
+    ecs_input_advance_to_tick(&it, 1);
+
+    /* tick 9 aliases tick 1's ring slot. tick 1 <= frontier so evictable. */
+    ti_cmd_append(&it, BUF + 1u, s, &v_new, 32);
+
+    /* Old tick 1 commands gone (row evicted). */
+    ecs_input_cmd_iter_t it_old = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p; uint32_t bl;
+    EXPECT(!ti_cmd_iter_next(&it_old, &p, &bl),
+                                            "ring-wrap: tick 1 commands evicted");
+
+    /* New tick 9: only the one fresh command. */
+    ecs_input_cmd_iter_t it_new = ecs_input_cmd_iter_begin(&it, BUF + 1u, s);
+    EXPECT(ti_cmd_iter_next(&it_new, &p, &bl) && bl == 32u && memcmp(p, &v_new, 4) == 0,
+                                            "ring-wrap: tick 9 fresh command");
+    EXPECT(!ti_cmd_iter_next(&it_new, &p, &bl),
+                                            "ring-wrap: tick 9 has only one cmd");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: sealed-tick append is no-op ----------------------- */
+
+static void test_input_cmd_sealed_drop(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    ecs_input_advance_to_tick(&it, 5);
+    uint32_t v = 0xCAFEu;
+    ti_cmd_append(&it, 5, s, &v, 16);
+    ti_cmd_append(&it, 3, s, &v, 16);
+    ti_cmd_append(&it, 6, s, &v, 16);
+
+    ecs_input_cmd_iter_t i5 = ecs_input_cmd_iter_begin(&it, 5, s);
+    const void* p; uint32_t bl;
+    EXPECT(!ti_cmd_iter_next(&i5, &p, &bl),
+                                            "sealed tick 5: append dropped");
+    ecs_input_cmd_iter_t i3 = ecs_input_cmd_iter_begin(&it, 3, s);
+    EXPECT(!ti_cmd_iter_next(&i3, &p, &bl),
+                                            "below-frontier tick 3: append dropped");
+    ecs_input_cmd_iter_t i6 = ecs_input_cmd_iter_begin(&it, 6, s);
+    EXPECT(ti_cmd_iter_next(&i6, &p, &bl) && bl == 16u,
+                                            "above-frontier tick 6: append kept");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: dead slot append is no-op ------------------------- */
+
+static void test_input_cmd_dead_slot_drop(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t v = 0xAAu;
+
+    /* Slot never allocated. */
+    ti_cmd_append(&it, 1, 0, &v, 8);
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 1, 0);
+    const void* p; uint32_t bl;
+    EXPECT(!ti_cmd_iter_next(&i, &p, &bl), "dead slot: append dropped");
+
+    /* Allocate, free, append -> dropped. */
+    uint32_t s = ecs_input_alloc_slot(&it);
+    ecs_input_free_slot(&it, s);
+    ti_cmd_append(&it, 1, s, &v, 8);
+    ecs_input_cmd_iter_t i2 = ecs_input_cmd_iter_begin(&it, 1, s);
+    EXPECT(!ti_cmd_iter_next(&i2, &p, &bl), "freed slot: append dropped");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: alloc/free ABA scrubs commands -------------------- */
+
+static void test_input_cmd_alloc_aba(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v = 0x1234u;
+    ti_cmd_append(&it, 1, s, &v, 16);
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&it, 1, s);
+    const void* p; uint32_t bl;
+    EXPECT(ti_cmd_iter_next(&i0, &p, &bl), "first owner: command visible");
+
+    ecs_input_free_slot(&it, s);
+    uint32_t s2 = ecs_input_alloc_slot(&it);
+    EXPECT(s2 == s, "alloc reuses slot");
+
+    /* New owner must NOT see prior owner's commands. */
+    ecs_input_cmd_iter_t i1 = ecs_input_cmd_iter_begin(&it, 1, s2);
+    EXPECT(!ti_cmd_iter_next(&i1, &p, &bl),
+                                            "ABA defense: new owner has no commands at tick 1");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: serialize/deserialize FIFO order ------------------ */
+
+static void test_input_cmd_serialize_order_roundtrip(void) {
+    /* Two peers, slot-aligned. Sender appends a known sequence at tick T;
+       deserialize on receiver and verify EXACT iter order match. */
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+    ti_register_test_cmd_types(&a);
+    ti_register_test_cmd_types(&b);
+
+    uint32_t sa[3], sb[3];
+    for (int i = 0; i < 3; i++) {
+        sa[i] = ecs_input_alloc_slot(&a);
+        sb[i] = ecs_input_alloc_slot(&b);
+        EXPECT(sa[i] == sb[i], "slot align");
+    }
+
+    /* Distinct payloads per command, distinct sizes per slot. */
+    /* slot 0: 4 commands at 8/13/20/64 bits.
+       slot 1: 0 commands (sparse path).
+       slot 2: 2 commands at 32/32 bits. */
+    uint8_t  s0_c0[1]  = { 0xA5 };
+    uint8_t  s0_c1[2]  = { 0x12, 0x1F };  /* 13 bits: only low 13 used = 0x1F12 & 0x1FFF */
+    uint8_t  s0_c2[3]  = { 0xDE, 0xAD, 0x0B }; /* 20 bits */
+    uint8_t  s0_c3[8]  = { 1, 2, 3, 4, 5, 6, 7, 8 }; /* 64 bits */
+    uint32_t s2_c0     = 0xCAFEBABEu;
+    uint32_t s2_c1     = 0xFEEDF00Du;
+
+    ti_cmd_append(&a, 11, sa[0], s0_c0, 8);
+    ti_cmd_append(&a, 11, sa[2], &s2_c0, 32);
+    ti_cmd_append(&a, 11, sa[0], s0_c1, 13);
+    ti_cmd_append(&a, 11, sa[0], s0_c2, 20);
+    ti_cmd_append(&a, 11, sa[2], &s2_c1, 32);
+    ti_cmd_append(&a, 11, sa[0], s0_c3, 64);
+
+    /* Capture sender iter order. */
+    typedef struct { uint32_t bit_len; uint8_t bytes[16]; } ti_cmd_snap;
+    ti_cmd_snap snap[3][8];
+    int snap_n[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        ecs_input_cmd_iter_t it = ecs_input_cmd_iter_begin(&a, 11, sa[i]);
+        const void* p; uint32_t bl;
+        while (ti_cmd_iter_next(&it, &p, &bl)) {
+            snap[i][snap_n[i]].bit_len = bl;
+            uint32_t bytes = (bl + 7u) >> 3;
+            memset(snap[i][snap_n[i]].bytes, 0, sizeof(snap[i][snap_n[i]].bytes));
+            if (bytes) memcpy(snap[i][snap_n[i]].bytes, p, bytes);
+            snap_n[i]++;
+        }
+    }
+    EXPECT(snap_n[0] == 4, "sender slot 0 has 4 commands");
+    EXPECT(snap_n[1] == 0, "sender slot 1 has 0 commands");
+    EXPECT(snap_n[2] == 2, "sender slot 2 has 2 commands");
+
+    /* Round-trip via serialize. */
+    uint64_t buf[256] = {0};
+    ecs_serializer_t s;
+    ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 11, 0, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d;
+    ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+
+    /* Verify receiver iter order matches sender exactly. */
+    for (int i = 0; i < 3; i++) {
+        ecs_input_cmd_iter_t it = ecs_input_cmd_iter_begin(&b, 11, sb[i]);
+        const void* p; uint32_t bl;
+        int k = 0;
+        while (ti_cmd_iter_next(&it, &p, &bl)) {
+            EXPECT(k < snap_n[i], "receiver does not over-deliver");
+            EXPECT(bl == snap[i][k].bit_len, "receiver bit_len matches sender");
+            uint32_t bytes = (bl + 7u) >> 3;
+            int byte_match = (bytes == 0) || (memcmp(p, snap[i][k].bytes, bytes) == 0);
+            EXPECT(byte_match, "receiver bytes match sender (in order)");
+            k++;
+        }
+        EXPECT(k == snap_n[i], "receiver yields exactly sender count");
+    }
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- command stream: deserialize skips dead slot ----------------------- */
+
+static void test_input_cmd_deserialize_dead_skip(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 16);
+    ecs_input_init(&b, sizeof(ti_input_t), 16);
+    ti_register_test_cmd_types(&a);
+    ti_register_test_cmd_types(&b);
+
+    uint32_t sa0 = ecs_input_alloc_slot(&a);
+    uint32_t sa1 = ecs_input_alloc_slot(&a);
+    uint32_t sb0 = ecs_input_alloc_slot(&b);
+    /* b has only slot 0 live. Sender's slot 1 must be skipped. */
+    EXPECT(sa0 == sb0 && sa1 == 1u, "alignment");
+    EXPECT(!ecs_input_slot_is_live(&b, 1), "receiver slot 1 dead");
+
+    uint32_t v0 = 0xAAu;
+    uint32_t v1 = 0xBBu;
+    ti_cmd_append(&a, 5, sa0, &v0, 8);
+    ti_cmd_append(&a, 5, sa1, &v1, 8);
+
+    uint64_t buf[64] = {0};
+    ecs_serializer_t s; ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 5, 0, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+
+    ecs_deserializer_t d; ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+    ecs_input_deserialize_tick(&b, &d);
+
+    /* slot 0 received. */
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&b, 5, sb0);
+    const void* p; uint32_t bl;
+    EXPECT(ti_cmd_iter_next(&i0, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0xAAu,
+                                            "receiver slot 0: command applied");
+    EXPECT(!ti_cmd_iter_next(&i0, &p, &bl), "slot 0 single command");
+
+    /* slot 1 dropped silently. No iter call; just no observable state. */
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- command stream: deserialize is idempotent on duplicate packets --- */
+
+static void test_input_cmd_deserialize_idempotent(void) {
+    ecs_input_t a, b;
+    ecs_input_init(&a, sizeof(ti_input_t), 32);
+    ecs_input_init(&b, sizeof(ti_input_t), 32);
+    ti_register_test_cmd_types(&a);
+    ti_register_test_cmd_types(&b);
+
+    uint32_t sa[2], sb[2];
+    for (int i = 0; i < 2; i++) {
+        sa[i] = ecs_input_alloc_slot(&a);
+        sb[i] = ecs_input_alloc_slot(&b);
+    }
+
+    uint32_t v0 = 0x11223344u;
+    uint32_t v1 = 0xAABBCCDDu;
+    uint16_t v2 = 0x55AAu;
+    ti_cmd_append(&a, 7, sa[0], &v0, 32);
+    ti_cmd_append(&a, 7, sa[0], &v1, 32);
+    ti_cmd_append(&a, 7, sa[1], &v2, 16);
+
+    uint64_t buf[64] = {0};
+    ecs_serializer_t s; ecs_serializer_init(&s, buf, sizeof(buf));
+    ecs_input_serialize_tick(&a, &s, 7, 0, sizeof(buf));
+    ecs_serializer_flush_bits(&s);
+
+    /* Apply the SAME packet 3 times. */
+    for (int n = 0; n < 3; n++) {
+        ecs_deserializer_t d; ecs_deserializer_init_bits(&d, buf, ecs_serializer_get_bits_written(&s));
+        ecs_input_deserialize_tick(&b, &d);
+    }
+
+    /* Receiver state must equal sender's: 2 commands on slot 0, 1 on slot 1,
+       in append order. NOT 6/3/etc. */
+    ecs_input_cmd_iter_t i0 = ecs_input_cmd_iter_begin(&b, 7, sb[0]);
+    const void* p; uint32_t bl;
+    EXPECT(ti_cmd_iter_next(&i0, &p, &bl) && bl == 32u && memcmp(p, &v0, 4) == 0,
+                                            "idempotent: slot 0 cmd[0] = v0 (not duplicated)");
+    EXPECT(ti_cmd_iter_next(&i0, &p, &bl) && bl == 32u && memcmp(p, &v1, 4) == 0,
+                                            "idempotent: slot 0 cmd[1] = v1");
+    EXPECT(!ti_cmd_iter_next(&i0, &p, &bl),
+                                            "idempotent: slot 0 has exactly 2 cmds after 3 receives");
+
+    ecs_input_cmd_iter_t i1 = ecs_input_cmd_iter_begin(&b, 7, sb[1]);
+    EXPECT(ti_cmd_iter_next(&i1, &p, &bl) && bl == 16u && memcmp(p, &v2, 2) == 0,
+                                            "idempotent: slot 1 cmd[0] = v2");
+    EXPECT(!ti_cmd_iter_next(&i1, &p, &bl),
+                                            "idempotent: slot 1 has exactly 1 cmd after 3 receives");
+
+    ecs_input_destroy(&a);
+    ecs_input_destroy(&b);
+}
+
+/* --- command stream: clear evicts ------------------------------------- */
+
+static void test_input_cmd_clear_resets(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 16);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v = 0x77u;
+    ti_cmd_append(&it, 3, s, &v, 8);
+    ti_cmd_append(&it, 3, s, &v, 8);
+
+    ecs_input_clear(&it, 3);
+
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 3, s);
+    const void* p; uint32_t bl;
+    EXPECT(!ti_cmd_iter_next(&i, &p, &bl), "clear: tick commands gone");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: grow_buf preserves resident commands -------------- */
+
+static void test_input_cmd_grow_buf_preserves(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 8);
+    uint32_t s = ecs_input_alloc_slot(&it);
+
+    uint32_t v[3] = { 0x11u, 0x22u, 0x33u };
+    ti_cmd_append(&it, 5, s, &v[0], 8);
+    ti_cmd_append(&it, 5, s, &v[1], 8);
+    ti_cmd_append(&it, 5, s, &v[2], 8);
+
+    ecs_input_grow_buf(&it, 64);
+    EXPECT(it.buf_size == 64u, "ring grew");
+
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 5, s);
+    const void* p; uint32_t bl;
+    EXPECT(ti_cmd_iter_next(&i, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0x11u,
+                                            "post-grow: cmd[0]");
+    EXPECT(ti_cmd_iter_next(&i, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0x22u,
+                                            "post-grow: cmd[1]");
+    EXPECT(ti_cmd_iter_next(&i, &p, &bl) && bl == 8u && *(const uint8_t*)p == 0x33u,
+                                            "post-grow: cmd[2]");
+    EXPECT(!ti_cmd_iter_next(&i, &p, &bl), "post-grow: exhausted");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- command stream: grow_player_cap preserves ------------------------- */
+
+static void test_input_cmd_grow_player_cap_preserves(void) {
+    ecs_input_t it; ecs_input_init(&it, sizeof(ti_input_t), 32);
+    uint32_t s0 = ecs_input_alloc_slot(&it);
+
+    uint32_t v[2] = { 0xABu, 0xCDu };
+    ti_cmd_append(&it, 2, s0, &v[0], 8);
+    ti_cmd_append(&it, 2, s0, &v[1], 8);
+
+    ecs_input_grow_player_cap(&it, 64);
+    EXPECT(it.active_cap == 64u, "active_cap grew");
+
+    ecs_input_cmd_iter_t i = ecs_input_cmd_iter_begin(&it, 2, s0);
+    const void* p; uint32_t bl;
+    EXPECT(ti_cmd_iter_next(&i, &p, &bl) && *(const uint8_t*)p == 0xABu,
+                                            "post-cap-grow: cmd[0]");
+    EXPECT(ti_cmd_iter_next(&i, &p, &bl) && *(const uint8_t*)p == 0xCDu,
+                                            "post-cap-grow: cmd[1]");
+    EXPECT(!ti_cmd_iter_next(&i, &p, &bl), "post-cap-grow: exhausted");
+
+    ecs_input_destroy(&it);
+}
+
+/* --- entry point ------------------------------------------------------- */
+
+static int test_input_all(void) {
+    int before = g_failed;
+    printf("=== ecs_input_t tests ===\n\n");
+    RUN_TEST(test_input_basic_roundtrip);
+    RUN_TEST(test_input_get_unknown);
+    RUN_TEST(test_input_set_idempotent_same_value);
+    RUN_TEST(test_input_set_overwrite);
+    RUN_TEST(test_input_multi_packet_split);
+    RUN_TEST(test_input_frontier_sim_driven);
+    RUN_TEST(test_input_past_frontier_confirmed);
+    RUN_TEST(test_input_partial_no_advance);
+    RUN_TEST(test_input_ring_wrap);
+    RUN_TEST(test_input_clear);
+    RUN_TEST(test_input_alloc_free_cycle);
+    RUN_TEST(test_input_deterministic_replay);
+    RUN_TEST(test_input_advance_to_tick);
+    RUN_TEST(test_input_predicted_after_confirmed_dropped);
+    RUN_TEST(test_input_empty_roster);
+    RUN_TEST(test_input_iterator);
+    RUN_TEST(test_input_player_cap);
+    RUN_TEST(test_input_persistence);
+    RUN_TEST(test_input_ooo_backward_fill);
+    RUN_TEST(test_input_auto_grow_burst);
+    RUN_TEST(test_input_grow_buf_preemptive);
+    RUN_TEST(test_input_grow_player_cap_consistency);
+    RUN_TEST(test_input_grow_buf_consistency);
+    RUN_TEST(test_input_grow_combined_consistency);
+    RUN_TEST(test_input_serialize_roundtrip);
+    RUN_TEST(test_input_serialize_redundancy_zero);
+    RUN_TEST(test_input_serialize_all_zero_compact);
+    RUN_TEST(test_input_serialize_unregistered_skipped);
+    RUN_TEST(test_input_serialize_redundancy_eight);
+    RUN_TEST(test_input_cmd_basic_fifo);
+    RUN_TEST(test_input_cmd_multi_slot_fifo);
+    RUN_TEST(test_input_cmd_first_touch_reset);
+    RUN_TEST(test_input_cmd_sealed_drop);
+    RUN_TEST(test_input_cmd_dead_slot_drop);
+    RUN_TEST(test_input_cmd_alloc_aba);
+    RUN_TEST(test_input_cmd_serialize_order_roundtrip);
+    RUN_TEST(test_input_cmd_deserialize_dead_skip);
+    RUN_TEST(test_input_cmd_deserialize_idempotent);
+    RUN_TEST(test_input_cmd_clear_resets);
+    RUN_TEST(test_input_cmd_grow_buf_preserves);
+    RUN_TEST(test_input_cmd_grow_player_cap_preserves);
+    int failed = g_failed - before;
+    printf("\ninput: %d failed\n", failed);
+    return failed ? 1 : 0;
+}
