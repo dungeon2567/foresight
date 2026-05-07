@@ -52,7 +52,8 @@
       "Bash(xargs sed *)",
       "Bash(cmake --build out/build/x64-release --target ecs_bench)",
       "Bash(powershell -Command \"\\(Get-Content tests/test_input.h -Raw\\) -replace 'ecs_input_set\\\\\\(\\(&[a-z_A-Z0-9]+, [^,]+, [^,]+, &[a-zA-Z0-9_\\\\[\\\\]]+, \\(true|false\\)\\), [^\\)]+\\\\\\)', 'ecs_input_set\\(\\\\$1\\)' | Set-Content tests/test_input.h\")",
-      "Bash(powershell -Command \"\\(Get-Content tests/test_input.h -Raw\\) -replace 'ecs_input_frontier\\\\\\(\\([^,]+\\), &valid\\\\\\)', 'ecs_input_frontier\\(\\\\$1\\)' -replace 'ecs_input_frontier\\\\\\(\\([^,]+\\), &\\([a-z]+\\)\\\\\\)', 'ecs_input_frontier\\(\\\\$1\\)' | Set-Content tests/test_input.h\")"
+      "Bash(powershell -Command \"\\(Get-Content tests/test_input.h -Raw\\) -replace 'ecs_input_frontier\\\\\\(\\([^,]+\\), &valid\\\\\\)', 'ecs_input_frontier\\(\\\\$1\\)' -replace 'ecs_input_frontier\\\\\\(\\([^,]+\\), &\\([a-z]+\\)\\\\\\)', 'ecs_input_frontier\\(\\\\$1\\)' | Set-Content tests/test_input.h\")",
+      "Bash(grep -rn \"ecs.c\\\\|src/ecs\\\\\\\\.c\" CMakeLists.txt benchmarks/)"
     ],
     "autoApprove": true
   }

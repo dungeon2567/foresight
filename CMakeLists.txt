@@ -119,7 +119,9 @@ endif()
 if (ECS_BUILD_TESTS)
     add_executable(ecs
         main.c
-        src/ecs.c
+        src/ecs_crc64.c
+        src/ecs_tree.c
+        src/ecs_world.c
         src/ecs_query.c
         src/broadphase.c
         src/input.c
@@ -155,7 +157,9 @@ if (ECS_BUILD_BENCH)
         benchmarks/bench_main.cpp
         benchmarks/bench_integrate.c
         benchmarks/bench_broadphase.c
-        src/ecs.c
+        src/ecs_crc64.c
+        src/ecs_tree.c
+        src/ecs_world.c
         src/ecs_query.c
         src/broadphase.c
     )

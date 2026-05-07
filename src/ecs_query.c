@@ -1,4 +1,4 @@
-#include "ecs.h"
+#include "ecs_query.h"
 #include <ctype.h>
 #include <string.h>
 #include <stddef.h>
@@ -258,4 +258,254 @@ ecs_compiled_query_t* ecs_compile_query(const ecs_world_t* world, const char* ex
         out->clauses[c].exclude = d.cl[c].neg;
     }
     return out;
+}
+
+/* ==========================================================================
+   Iterator -- block-driven walk over the query's tree intersection.
+
+   Module-private mutable scratch nodes that iterator pointers can be aimed
+   at on the very first call so the deferred mask-flush loop in
+   ecs_iterator_next_block can run unconditionally without first-call gating.
+
+   Kept separate from ecs_default_l1 / ecs_default_l2 so writers can't
+   accidentally pollute the read-only defaults that every empty subtree
+   shares (children[] arrays).
+   ========================================================================== */
+static ecs_l1_t iter_scratch_l1;        /* zero-init, module-private */
+static ecs_l2_t iter_scratch_l2;        /* zero-init, module-private */
+
+static uint64_t iter_compute_l3_mask(const ecs_compiled_query_t* q,
+                                     const ecs_l3_t* const l3[]) {
+    uint64_t result = 0;
+    for (uint32_t c = 0; c < q->clause_count; c++) {
+        const ecs_compiled_clause_t* cl = &q->clauses[c];
+        if (!cl->include && !cl->exclude && !cl->changed) continue;
+
+        uint64_t bits = ~0ULL;
+        uint32_t mask = cl->include;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l3[n]->predicted_mask_any; }
+        /* Exclude prune: drop subtree where every slot has the term
+           (mask_all bit set). Partial subtrees fall through to L1 for exact
+           filtering. */
+        mask = cl->exclude;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l3[n]->predicted_mask_all; }
+        if (cl->changed) {
+            uint64_t any_changed = 0;
+            mask = cl->changed;
+            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l3[n]->changed; }
+            bits &= any_changed;
+        }
+        result |= bits;
+    }
+    return result;
+}
+
+static uint64_t iter_compute_l2_mask(const ecs_compiled_query_t* q,
+                                     const ecs_l2_t* const l2[]) {
+    uint64_t result = 0;
+    for (uint32_t c = 0; c < q->clause_count; c++) {
+        const ecs_compiled_clause_t* cl = &q->clauses[c];
+        if (!cl->include && !cl->exclude && !cl->changed) continue;
+        uint64_t bits = ~0ULL;
+        uint32_t mask = cl->include;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l2[n]->predicted_mask_any; }
+        mask = cl->exclude;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l2[n]->predicted_mask_all; }
+        if (cl->changed) {
+            uint64_t any_changed = 0;
+            mask = cl->changed;
+            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l2[n]->changed; }
+            bits &= any_changed;
+        }
+        result |= bits;
+    }
+    return result;
+}
+
+static uint64_t iter_compute_l1_mask(const ecs_compiled_query_t* q,
+                                     const ecs_l1_t* const l1[]) {
+    uint64_t result = 0;
+    for (uint32_t c = 0; c < q->clause_count; c++) {
+        const ecs_compiled_clause_t* cl = &q->clauses[c];
+        if (!cl->include && !cl->exclude && !cl->changed) continue;
+
+        uint64_t bits = ~0ULL;
+        uint32_t mask = cl->include;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= l1[n]->predicted_mask_any; }
+        mask = cl->exclude;
+        while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; bits &= ~l1[n]->predicted_mask_any; }
+        if (cl->changed) {
+            uint64_t any_changed = 0;
+            mask = cl->changed;
+            while (mask) { int n = ecs_ctz32(mask); mask &= mask-1; any_changed |= l1[n]->changed; }
+            bits &= any_changed;
+        }
+        result |= bits;
+    }
+    return result;
+}
+
+static inline void iter_load_l1(ecs_iterator_t* it, uint32_t tree_count) {
+    for (uint32_t i = 0; i < tree_count; i++) {
+        ecs_l1_t* l1 = (ecs_l1_t*)it->l2[i]->children[it->l2_idx];
+        /* Prefetch L1 mask line. Address already in hand (loaded above), no
+           extra work. Goal isn't to hide a single demand miss -- it's to
+           expose DRAM parallelism: iter_compute_l1_mask reads l1[n]->mask
+           through a serial `bits &= ...` AND chain, which CPU can't reorder.
+           Issuing N prefetches here lets the misses fetch concurrently via
+           LFBs instead of serializing. */
+        ECS_PREFETCH(l1);
+        ((ecs_l1_t**)it->l1)[i]  = l1;
+        ((void**)it->l1_data)[i] = (char*)l1 + sizeof(ecs_l1_t);
+    }
+}
+
+void ecs_iterator_init(ecs_iterator_t* it, const ecs_compiled_query_t* query, uint32_t write_mask) {
+    it->query      = query;
+    it->l2_mask    = 0;
+    it->l3_idx     = 0;
+    it->l2_idx     = 0;
+    *(uint32_t*)&it->write_mask      = write_mask;
+    *(ecs_mode_t*)&it->mode          = query->tree_count ? query->trees[0]->mode : ECS_MODE_CONFIRMED;
+    *(const ecs_world_t**)&it->world = query->world;
+
+    const ecs_tree_t* base = query->world ? &query->world->trees[0] : NULL;
+    uint32_t tc = query->tree_count;
+    for (uint32_t i = 0; i < tc; i++) {
+        ecs_tree_t* t = query->trees[i];
+        assert(t->mode == it->mode &&
+               "ecs_iterator_init: all query trees must share VM mode");
+        if (base) {
+            ptrdiff_t wt_idx = t - base;
+            assert(wt_idx >= 0 && wt_idx < 64 &&
+                   "ecs_iterator_init: query tree not in query->world->trees[]");
+            ((uint8_t*)it->world_tree_idx)[i] = (uint8_t)wt_idx;
+        } else {
+            ((uint8_t*)it->world_tree_idx)[i] = 0;
+        }
+        it->l3[i]                   = t->root;
+        it->l2[i]                   = &iter_scratch_l2;
+        ((ecs_l1_t**)it->l1)[i]     = &iter_scratch_l1;
+        ((void**)it->l1_data)[i]    = NULL;
+        ((size_t*)it->data_size)[i] = t->data_size;
+    }
+    it->l3_mask = iter_compute_l3_mask(query, it->l3);
+}
+
+uint64_t ecs_iterator_next_block(ecs_iterator_t* it) {
+    const ecs_compiled_query_t* q  = it->query;
+    int      predict = it->mode;
+    uint32_t wm      = it->write_mask;
+
+    /* FUSED block-boundary flush + L1->L2 propagation in one pass over
+       write_mask trees. Flush realises mask updates that ecs_iterator_get_mut
+       deferred (dirty / predicted_mask_any / confirmed_mask_any from
+       l1->changed); propagation summarises the just-yielded L1's dirty/changed
+       up to L2 at the prior l2_idx.
+
+       No first-call gate: iter_init aims l1[*] / l2[*] at iter_scratch_l1 /
+       iter_scratch_l2 (mutable, zero) so this loop's reads return zero and
+       its writes are OR-with-zero on the first call. iter_load_l1 swaps in
+       real pointers via the L3 / L2 descent before the first return. */
+    {
+        uint32_t bit = (uint32_t)it->l2_idx;
+        uint32_t w   = wm;
+        if (predict) {
+            while (w) {
+                uint32_t  t  = (uint32_t)ecs_ctz32(w); w &= w - 1;
+                ecs_l1_t* l1 = it->l1[t];
+                ecs_l2_t* l2 = (ecs_l2_t*)it->l2[t];
+                uint64_t  ch = l1->changed;
+                uint64_t  d  = l1->dirty | ch;
+                l1->dirty               = d;
+                l1->predicted_mask_any |= ch;
+                l2->dirty   |= (uint64_t)(d  != 0) << bit;
+                l2->changed |= (uint64_t)(ch != 0) << bit;
+            }
+        } else {
+            /* CONFIRMED: dirty stays 0 everywhere (invariant). */
+            while (w) {
+                uint32_t  t  = (uint32_t)ecs_ctz32(w); w &= w - 1;
+                ecs_l1_t* l1 = it->l1[t];
+                ecs_l2_t* l2 = (ecs_l2_t*)it->l2[t];
+                uint64_t  ch = l1->changed;
+                l1->predicted_mask_any |= ch;
+                l1->confirmed_mask_any |= ch;
+                l2->changed |= (uint64_t)(ch != 0) << bit;
+            }
+        }
+    }
+
+next_l2:
+    if (it->l2_mask) {
+        it->l2_idx  = ecs_ctz64(it->l2_mask);
+        it->l2_mask &= it->l2_mask - 1;
+        iter_load_l1(it, q->tree_count);
+        uint64_t mask = iter_compute_l1_mask(q, (const ecs_l1_t* const*)it->l1);
+        if (mask) return mask;
+        /* Empty L1 (query include filtered out): propagate just-loaded block's
+           dirty/changed up to L2 at new l2_idx. Other-path writers (tree_get_mut)
+           already eager-propagate, so this is idempotent for them; covers the
+           case where iter_get_mut wrote prior blocks of the same L2. */
+        uint32_t bit = (uint32_t)it->l2_idx;
+        uint32_t w   = wm;
+        if (predict) {
+            while (w) {
+                uint32_t t = (uint32_t)ecs_ctz32(w); w &= w - 1;
+                ecs_l1_t* l1 = it->l1[t];
+                ecs_l2_t* l2 = (ecs_l2_t*)it->l2[t];
+                l2->dirty   |= (uint64_t)(l1->dirty   != 0) << bit;
+                l2->changed |= (uint64_t)(l1->changed != 0) << bit;
+            }
+        } else {
+            while (w) {
+                uint32_t t = (uint32_t)ecs_ctz32(w); w &= w - 1;
+                ecs_l2_t* l2 = (ecs_l2_t*)it->l2[t];
+                l2->changed |= (uint64_t)(it->l1[t]->changed != 0) << bit;
+            }
+        }
+        goto next_l2;
+    }
+
+    /* L2->L3 propagation. No first-call gate: l2[*] still points at
+       iter_scratch_l2 (zero) on the very first call, so the OR resolves to
+       OR-with-zero against real l3[*]->dirty/changed at l3_idx=0 (init dummy)
+       -- a no-op write. After the L3 advance below replaces l3_idx with a
+       real bit, subsequent calls see real l2[*] and propagate properly. */
+    {
+        uint32_t bit = (uint32_t)it->l3_idx;
+        uint32_t w   = wm;
+        if (predict) {
+            while (w) {
+                uint32_t t = (uint32_t)ecs_ctz32(w); w &= w - 1;
+                const ecs_l2_t* l2 = it->l2[t];
+                ecs_l3_t* l3 = (ecs_l3_t*)it->l3[t];
+                l3->dirty   |= (uint64_t)(l2->dirty   != 0) << bit;
+                l3->changed |= (uint64_t)(l2->changed != 0) << bit;
+            }
+        } else {
+            while (w) {
+                uint32_t t = (uint32_t)ecs_ctz32(w); w &= w - 1;
+                const ecs_l2_t* l2 = it->l2[t];
+                ecs_l3_t* l3 = (ecs_l3_t*)it->l3[t];
+                l3->changed |= (uint64_t)(l2->changed != 0) << bit;
+            }
+        }
+    }
+
+    if (it->l3_mask) {
+        it->l3_idx  = ecs_ctz64(it->l3_mask);
+        it->l3_mask &= it->l3_mask - 1;
+        uint32_t tc = q->tree_count;
+        for (uint32_t i = 0; i < tc; i++) {
+            const ecs_l2_t* l2 = it->l3[i]->children[it->l3_idx];
+            it->l2[i] = l2;
+            /* Same DRAM-parallelism rationale as iter_load_l1's L1 prefetch:
+               iter_compute_l2_mask reads l2[n]->masks through a serial AND chain. */
+            ECS_PREFETCH(l2);
+        }
+        it->l2_mask = iter_compute_l2_mask(q, it->l2);
+        goto next_l2;
+    }
+    return 0;
 }

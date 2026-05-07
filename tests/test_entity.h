@@ -158,6 +158,147 @@ static void test_entity_spawn_predict_then_confirmed(void) {
     ecs_world_destroy(w); ecs_free(w);
 }
 
+/* ecs_world_init also reserves trees[1] as a "destroyed" tag tree. Bit 1 set
+   in world->mask alongside bit 0. */
+static void test_world_init_reserves_destroyed_tree(void) {
+    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_world_init(w);
+
+    EXPECT(w->trees[1].data_size == 0,                   "trees[1] is tag (data_size=0)");
+    EXPECT((w->mask & (1ULL << 1)) != 0,                 "world mask bit 1 set");
+    EXPECT(w->trees[1].name && strcmp(w->trees[1].name, "destroyed") == 0,
+                                                          "trees[1] named 'destroyed'");
+    EXPECT(w->trees[1].root != NULL,                      "destroyed tree root allocated");
+    EXPECT(w->trees[1].root->predicted_mask_any == 0,    "destroyed mask starts empty");
+
+    ecs_world_destroy(w); ecs_free(w);
+}
+
+/* despawn flips the tag bit; entity slot stays alive in the same tick. */
+static void test_entity_despawn_tags_only_until_end_tick(void) {
+    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_world_init(w);
+
+    entity_t e0 = ecs_entity_spawn(w);
+    entity_t e1 = ecs_entity_spawn(w);
+    ecs_entity_despawn(w, e0);
+
+    EXPECT((w->trees[1].root->children[0]->children[0]->predicted_mask_any & 1ULL) != 0,
+           "destroyed bit set for e0");
+    /* Entity slot still occupied -- only the tag was set. */
+    EXPECT((w->trees[0].root->children[0]->children[0]->predicted_mask_any & 1ULL) != 0,
+           "entity slot 0 stays occupied pre-reap");
+    /* Same-tick respawn cannot collide: spawn finds next free idx. */
+    entity_t e2 = ecs_entity_spawn(w);
+    EXPECT(e2.id == 2, "same-tick spawn skips the soon-to-die slot");
+    (void)e1;
+
+    ecs_world_destroy(w); ecs_free(w);
+}
+
+/* end-of-tick reap drops the slot from every populated tree. */
+static void test_entity_despawn_reap_clears_storage(void) {
+    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_world_init(w);
+
+    /* Add a storage tree at slot 2. */
+    ecs_tree_init(&w->trees[2], sizeof(comp_t), 0);
+    w->trees[2].name = "comp";
+    w->mask |= 1ULL << 2;
+
+    entity_t e0 = ecs_entity_spawn(w);
+    entity_t e1 = ecs_entity_spawn(w);
+    *(comp_t*)ecs_tree_get_mut(&w->trees[2], e0.id) = 11;
+    *(comp_t*)ecs_tree_get_mut(&w->trees[2], e1.id) = 22;
+
+    ecs_entity_despawn(w, e0);
+    ecs_world_end_tick(w);
+
+    EXPECT((w->trees[0].root->children[0]->children[0]->confirmed_mask_any & 1ULL) == 0,
+           "entity slot 0 reaped from entity tree");
+    EXPECT((w->trees[2].root->children[0]->children[0]->confirmed_mask_any & 1ULL) == 0,
+           "entity slot 0 reaped from storage tree");
+    EXPECT((w->trees[2].root->children[0]->children[0]->confirmed_mask_any & 2ULL) != 0,
+           "entity slot 1 untouched");
+    /* Destroyed tag tree wholesale-cleared (CONFIRMED reap path). */
+    EXPECT(w->trees[1].root->predicted_mask_any == 0, "destroyed tree drained");
+
+    ecs_world_destroy(w); ecs_free(w);
+}
+
+/* After reap, spawn reuses the freed idx; version diverges because
+   predicted_tick has advanced at least once. */
+static void test_entity_despawn_respawn_version_diverges(void) {
+    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_world_init(w);
+
+    w->predicted_tick = 10;
+    entity_t e0 = ecs_entity_spawn(w);
+    EXPECT(e0.id == 0 && e0.version == 10, "spawn at tick 10");
+
+    ecs_entity_despawn(w, e0);
+    ecs_world_end_tick(w);                  /* tick -> 11, reap drops slot 0 */
+
+    entity_t e0b = ecs_entity_spawn(w);
+    EXPECT(e0b.id == 0,             "freed idx reused after reap");
+    EXPECT(e0b.version != e0.version,
+                                    "respawn version differs from prior incarnation");
+    EXPECT(e0b.version == 11,       "version stamps from advanced predicted_tick");
+
+    ecs_world_destroy(w); ecs_free(w);
+}
+
+/* Re-despawning a slot already tagged in the same tick is a noop on state. */
+static void test_entity_despawn_idempotent(void) {
+    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_world_init(w);
+
+    entity_t e0 = ecs_entity_spawn(w);
+    ecs_entity_despawn(w, e0);
+    uint64_t mask_before = w->trees[1].root->children[0]->children[0]->predicted_mask_any;
+    ecs_entity_despawn(w, e0);
+    uint64_t mask_after  = w->trees[1].root->children[0]->children[0]->predicted_mask_any;
+    EXPECT(mask_before == mask_after, "second despawn leaves destroyed mask unchanged");
+
+    ecs_world_destroy(w); ecs_free(w);
+}
+
+/* PREDICT-mode despawn + end_tick reap: storage rollback restores the
+   entity slot via dirty bookkeeping. The destroyed tag tree is TEMPORARY,
+   so end_tick already wholesale-cleared it -- rollback finds it empty
+   regardless. Mask invariants hold on both. */
+static void test_entity_despawn_predict_rollback_restores(void) {
+    ecs_world_t* w = (ecs_world_t*)ecs_xcalloc(1, sizeof(ecs_world_t));
+    ecs_world_init(w);
+
+    /* Seed confirmed entity. */
+    entity_t e0 = ecs_entity_spawn(w);
+    EXPECT(e0.id == 0, "confirmed seed at slot 0");
+
+    ecs_world_set_mode(w, ECS_MODE_PREDICT);
+    w->predicted_tick = 5;
+
+    ecs_entity_despawn(w, e0);
+    ecs_world_end_tick(w);     /* tick->6, reap removes predicted_mask bit + dirty */
+
+    EXPECT((w->trees[0].root->children[0]->children[0]->predicted_mask_any & 1ULL) == 0,
+           "post-reap predicted shows entity gone");
+    EXPECT((w->trees[0].root->children[0]->children[0]->confirmed_mask_any & 1ULL) != 0,
+           "confirmed still has entity (PREDICT didn't touch it)");
+    EXPECT(w->trees[1].root->predicted_mask_any == 0,
+           "destroyed tree wholesale-cleared at end of tick (TEMPORARY)");
+
+    ecs_world_rollback(w);
+    EXPECT((w->trees[0].root->children[0]->children[0]->predicted_mask_any & 1ULL) != 0,
+           "rollback restores entity to predicted view");
+    EXPECT(w->trees[1].root->predicted_mask_any == 0,
+           "destroyed tree still empty post-rollback");
+    EXPECT(ecs_tree_masks_valid(&w->trees[0]), "entity tree masks valid post-rollback");
+    EXPECT(ecs_tree_masks_valid(&w->trees[1]), "destroyed tree masks valid post-rollback");
+
+    ecs_world_destroy(w); ecs_free(w);
+}
+
 static int test_entity_all(void) {
     int before = g_failed;
     printf("=== entity tests ===\n\n");
@@ -167,6 +308,12 @@ static int test_entity_all(void) {
     RUN_TEST(test_entity_spawn_descends_l2);
     RUN_TEST(test_entity_spawn_predict_rollback);
     RUN_TEST(test_entity_spawn_predict_then_confirmed);
+    RUN_TEST(test_world_init_reserves_destroyed_tree);
+    RUN_TEST(test_entity_despawn_tags_only_until_end_tick);
+    RUN_TEST(test_entity_despawn_reap_clears_storage);
+    RUN_TEST(test_entity_despawn_respawn_version_diverges);
+    RUN_TEST(test_entity_despawn_idempotent);
+    RUN_TEST(test_entity_despawn_predict_rollback_restores);
     int failed = g_failed - before;
     printf("\nentity: %d failed\n", failed);
     return failed ? 1 : 0;
