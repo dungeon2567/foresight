@@ -62,16 +62,17 @@ int compiler_build(const compiler_opts_t* opts, script_db_t* db) {
     script_blob_t* root = (script_blob_t*)blob_alloc(&w, sizeof(script_blob_t), _Alignof(script_blob_t));
 
     /* Pass 4: write tag_defs[] (def_offset = 0 for now; codegen patches schema,
-       we copy back after codegen completes). */
+       we copy back after codegen completes). name_offset/name_len are filled
+       by pass 7 below. */
     tag_def_t* td = (tag_def_t*)blob_alloc(&w, schema.count * sizeof(tag_def_t), _Alignof(tag_def_t));
     if (td) {
         for (uint32_t i = 0; i < schema.count; i++) {
             const schema_tag_t* s = &schema.tags[i];
-            td[i].parent     = s->parent;
-            td[i].out        = s->out;
-            td[i].name_hash  = s->hash;
-            td[i].kind       = s->kind;
-            td[i].def_offset = 0;
+            td[i].parent           = s->parent;
+            td[i].out              = s->out;
+            td[i].def_offset_kind  = tag_def_pack(0, s->kind);
+            td[i].name_offset      = 0;
+            td[i].name_len         = (uint16_t)s->len;
         }
         blob_arr_set(&root->tag_defs, td, schema.count);
     }
@@ -82,18 +83,38 @@ int compiler_build(const compiler_opts_t* opts, script_db_t* db) {
         if (!sources[i]) continue;
         ast_idx_t r = parser_root(&parsers[i]);
         if (r == 0) continue;
-        codegen_run(&w, &parsers[i].arena, r, &schema);
+        codegen_run(&w, &parsers[i], r, &schema);
     }
 
-    /* Pass 6: copy schema's def_offset values back into tag_defs[].def_offset.
-       (Schema entries are sorted by id; tag_defs[id] is index-aligned.) */
+    /* Pass 6: copy schema's def_offset into tag_defs[]. Kind already packed in
+       pass 4; here we just merge the offset bits (high 24) without disturbing
+       kind (low 8). Schema entries are sorted by id; tag_defs[id] is
+       index-aligned. */
     if (td) {
         for (uint32_t i = 0; i < schema.count; i++) {
-            td[i].def_offset = schema.tags[i].def_offset;
+            td[i].def_offset_kind = tag_def_pack(schema.tags[i].def_offset,
+                                                  schema.tags[i].kind);
         }
     }
 
-    /* Pass 7: schema CRC placeholder (real: crc64 of joined sorted tag paths). */
+    /* Pass 7: string table — concatenate tag paths in id order at the blob
+       tail (cold region). Each path is appended raw bytes, no NUL. The
+       offset into the blob is written back into both schema.tags[i].name_offset
+       and tag_def_t.name_offset for runtime lookup via tag_def_name(). */
+    if (td) {
+        for (uint32_t i = 0; i < schema.count; i++) {
+            schema_tag_t* s = &schema.tags[i];
+            if (s->len == 0) continue;
+            void* dst = blob_alloc(&w, s->len, 1);
+            if (!dst) break;
+            memcpy(dst, s->path, s->len);
+            uint32_t off = (uint32_t)((uint8_t*)dst - w.base);
+            s->name_offset    = off;
+            td[i].name_offset = off;
+        }
+    }
+
+    /* Pass 8: schema CRC placeholder (real: crc64 of joined sorted tag paths). */
     root->schema_crc = (uint64_t)schema.count;
 
     /* Trim: realloc shrink — rel offsets are relative, survive. */

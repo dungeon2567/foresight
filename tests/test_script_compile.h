@@ -35,23 +35,17 @@ static int g_script_compile_failures = 0;
     if (g_script_compile_failures == _f0) printf("  %s  OK\n", #fn + 5); \
 } while (0)
 
-/* FNV-1a — must match parser_t::intern_tag (ecs_parser.c) and
-   tag_schema_intern (ecs_schema.c). Same seed + prime; same byte order. */
-static uint32_t scc_fnv1a(const char* s) {
-    uint32_t h = 0x811c9dc5u;
-    while (*s) {
-        h ^= (uint8_t)*s++;
-        h *= 0x01000193u;
-    }
-    return h;
-}
-
+/* Look up tag_def_t by full dotted path. Reads each entry's name from the
+   blob's cold string table (tag_def_t.name_offset / name_len) and memcmps
+   against the query — same path the runtime would walk for save/load remap. */
 static const tag_def_t* scc_find(const script_db_t* db, const char* path) {
-    uint32_t want = scc_fnv1a(path);
+    uint32_t want_len = (uint32_t)strlen(path);
     const tag_def_t* defs = BLOB_ARR(&db->root->tag_defs, tag_def_t);
     uint32_t n = db->root->tag_defs.count;
+    const uint8_t* base = (const uint8_t*)db->root;
     for (uint32_t i = 0; i < n; i++) {
-        if (defs[i].name_hash == want) return &defs[i];
+        if (defs[i].name_len != want_len) continue;
+        if (memcmp(base + defs[i].name_offset, path, want_len) == 0) return &defs[i];
     }
     return NULL;
 }
@@ -88,7 +82,7 @@ static void test_script_compile_samples(void) {
     if (!db.root) return;  /* nothing more to assert if blob never built */
 
     /* H4 invariant — sentinel relies on header at offset 0. */
-    SCC_CHECK(((uintptr_t)&db.root->schema_crc - (uintptr_t)db.root) == 0);
+    SCC_CHECK(((uintptr_t)&db.root->tag_defs - (uintptr_t)db.root) == 0);
 
     /* Tag-defs blob non-empty and reachable. */
     SCC_CHECK(db.root->tag_defs.count > 0);
@@ -98,15 +92,15 @@ static void test_script_compile_samples(void) {
     /* Top-level decls: each name → one tag_def with the matching kind. */
     const tag_def_t* player = scc_find(&db, "player");
     SCC_CHECK(player != NULL);
-    if (player) SCC_CHECK(player->kind == TAG_KIND_PREFAB);
+    if (player) SCC_CHECK(tag_def_kind(player) == TAG_KIND_PREFAB);
 
     const tag_def_t* fireball = scc_find(&db, "fireball");
     SCC_CHECK(fireball != NULL);
-    if (fireball) SCC_CHECK(fireball->kind == TAG_KIND_ABILITY);
+    if (fireball) SCC_CHECK(tag_def_kind(fireball) == TAG_KIND_ABILITY);
 
     const tag_def_t* burning = scc_find(&db, "burning");
     SCC_CHECK(burning != NULL);
-    if (burning) SCC_CHECK(burning->kind == TAG_KIND_EFFECT);
+    if (burning) SCC_CHECK(tag_def_kind(burning) == TAG_KIND_EFFECT);
 
     /* Auto-harvested from use sites — not declared as top-level. */
     SCC_CHECK(scc_find(&db, "status.burning") != NULL);  /* owned_tags */
@@ -125,15 +119,34 @@ static void test_script_compile_samples(void) {
     SCC_CHECK(scc_find(&db, "health.max") != NULL);
     SCC_CHECK(scc_find(&db, "mana")       != NULL);
 
+    /* Command tags from `commands { }` block — plain tags, no def_offset. */
+    const tag_def_t* fire = scc_find(&db, "fire");
+    SCC_CHECK(fire != NULL);
+    if (fire) {
+        SCC_CHECK(tag_def_kind(fire) == TAG_KIND_TAG);
+        SCC_CHECK(tag_def_def_offset(fire) == 0);
+    }
+    SCC_CHECK(scc_find(&db, "jump")              != NULL);
+    SCC_CHECK(scc_find(&db, "crouch")            != NULL);
+    SCC_CHECK(scc_find(&db, "ability.iceblast")  != NULL);
+    /* ability.fireball appears in both commands {} and fireball.script — same tag. */
+
+    /* Input slot names — interned as plain tags via `input { }`. */
+    const tag_def_t* move = scc_find(&db, "move");
+    SCC_CHECK(move != NULL);
+    if (move) SCC_CHECK(tag_def_kind(move) == TAG_KIND_TAG);
+    SCC_CHECK(scc_find(&db, "aim") != NULL);
+    /* `fire`, `jump`, `crouch` already checked above; input + commands share names. */
+
     /* def_offset == 0 sentinel: plain tags (no def). At least one of the
        ancestor tags must hit this path. */
     const tag_def_t* damage = scc_find(&db, "damage");
-    if (damage) SCC_CHECK(damage->def_offset == 0);
+    if (damage) SCC_CHECK(tag_def_def_offset(damage) == 0);
 
     /* def_offset != 0 for decls that emit a def struct.
        (Codegen patches schema after pass 5 — see ecs_compiler.c pass 6.) */
-    if (fireball) SCC_CHECK(fireball->def_offset != 0);
-    if (burning)  SCC_CHECK(burning->def_offset  != 0);
+    if (fireball) SCC_CHECK(tag_def_def_offset(fireball) != 0);
+    if (burning)  SCC_CHECK(tag_def_def_offset(burning)  != 0);
 
     script_db_destroy(&db);
     SCC_CHECK(db.root == NULL);

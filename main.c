@@ -14,6 +14,7 @@
 #include "test_entity.h"
 #include "test_script_vm.h"
 #include "test_script_compile.h"
+#include "test_player_input.h"
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -175,6 +176,7 @@ int main(void) {
                | test_entity_all()
                | test_script_vm_all()
                | test_script_compile_all()
+               | test_player_input_all()
                | (failures ? 1 : 0);
 
     return result;

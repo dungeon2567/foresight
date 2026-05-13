@@ -1,3 +1,22 @@
+// Top-level: command tag namespace + per-game input layout.
+// Both are anonymous decls (no name); one of each per game.
+
+commands {
+    fire
+    jump
+    crouch
+    command ability.fireball
+    command ability.iceblast
+}
+
+input {
+    button fire
+    button jump
+    button crouch
+    stick  move
+    stick  aim
+}
+
 // Player prefab.
 // Attributes are flat (tag, fixed_t value) pairs — no schema, no defaults
 // beyond what's listed here. Hooks on the spawned entity run when matching

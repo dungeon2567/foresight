@@ -50,7 +50,7 @@ static void test_script_layout(void) {
     SVM_CHECK(sizeof(effect_hdr_t)     == 28);   /* H1: type swap, size unchanged */
     SVM_CHECK(sizeof(effect_cap_t)     == 8);
     SVM_CHECK(sizeof(tag_def_t)        == 16);
-    SVM_CHECK(offsetof(script_blob_t, schema_crc) == 0);  /* H4: sentinel */
+    SVM_CHECK(offsetof(script_blob_t, tag_defs) == 0);  /* H4: sentinel — hot field at offset 0 */
     SVM_CHECK(offsetof(event_record_t, tag_id)        == 0);
     SVM_CHECK(offsetof(event_record_t, field_tags)    == 2);
     SVM_CHECK(offsetof(event_record_t, source)        == 8);

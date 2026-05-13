@@ -38,16 +38,39 @@ typedef enum {
 } tag_kind_t;
 
 typedef struct {
-    /* Hot half (first 8 bytes): read on every hierarchical tag match and
-       every def lookup. Compiler inserts 3 bytes after `kind` to align
-       `name_hash`; no explicit pad. */
-    uint16_t parent;      /* 0  -- 0xFFFF = root */
-    uint16_t out;         /* 2  -- HOT: hierarchical range end, [T, out) */
-    uint32_t def_offset;  /* 4  -- HOT: byte offset from blob root to def struct; 0 = plain tag */
-    /* Cold half (last 8 bytes): rarely touched after load. */
-    uint8_t  kind;        /* 8  -- tag_kind_t */
-    uint32_t name_hash;   /* 12 -- COLD: CRC32 of full dot-path; save/load remap */
-} tag_def_t;              /* 16 bytes (4 per cacheline) */
+    /* Hot half (first 8 bytes): everything needed for hierarchical match,
+       def dispatch, and decl-kind check lands in one cache line load.
+       `def_offset_kind` packs both fields: low 8 bits = kind (tag_kind_t),
+       high 24 bits = byte offset from blob root to def struct.
+         - kind == TAG_KIND_TAG  → plain tag, def_offset must be 0
+         - kind != TAG_KIND_TAG  → def at (blob_base + def_offset)
+       24-bit offset matches ECS_SCRIPT_BLOB_MAX (1<<24). */
+    uint16_t parent;            /* 0  -- 0xFFFF = root */
+    uint16_t out;               /* 2  -- HOT: hierarchical range end, [T, out) */
+    uint32_t def_offset_kind;   /* 4  -- HOT: (def_offset << 8) | kind */
+    /* Cold half (last 8 bytes): rarely touched after load.
+       name_offset / name_len index into the blob's cold string table
+       (concatenated tag paths). Path is full dotted form ("damage.fire"),
+       no NUL terminator. */
+    uint32_t name_offset;       /* 8  -- COLD: byte offset from blob root to path bytes */
+    uint16_t name_len;          /* 12 -- COLD: path byte length (no NUL) */
+    /* 2B compiler pad at 14 */
+} tag_def_t;                    /* 16 bytes (4 per cacheline) */
+
+/* Pack/unpack helpers — keep accessors inline; runtime touches them hot. */
+static inline uint32_t tag_def_pack(uint32_t def_offset, uint8_t kind) {
+    return (def_offset << 8) | (uint32_t)kind;
+}
+static inline uint8_t  tag_def_kind      (const tag_def_t* td) { return (uint8_t)(td->def_offset_kind & 0xFFu); }
+static inline uint32_t tag_def_def_offset(const tag_def_t* td) { return td->def_offset_kind >> 8; }
+
+/* Read a tag's name (not NUL-terminated). Caller must respect `out_len`. */
+static inline const char* tag_def_name(const void* blob_base,
+                                       const tag_def_t* td,
+                                       uint16_t* out_len) {
+    if (out_len) *out_len = td->name_len;
+    return (const char*)((const uint8_t*)blob_base + td->name_offset);
+}
 
 /* ==========================================================================
    Def structs — all live in the blob; all internal refs are blob_arr_t.
@@ -97,11 +120,15 @@ typedef struct {
 } prefab_def_t;
 
 typedef struct {
-    blob_arr_t requirements; /* tag_query_t[0..1]; count==0 → always pass */
-    blob_arr_t cancel;       /* tag_query_t[0..1]; count==0 → no cancel */
-    blob_arr_t owned_tags;   /* uint16_t[] sorted ascending — logical count */
-    blob_arr_t costs;        /* cost_entry_t[] */
-    blob_arr_t cooldowns;    /* cooldown_entry_t[] */
+    /* Read on every activation attempt (gating phase). Ordered to match
+       check sequence: requirements → cancel → cost availability. */
+    blob_arr_t requirements; /* tag_query_t[0..1] — apply-time: count==0 → always pass */
+    blob_arr_t cancel;       /* tag_query_t[0..1] — apply-time: count==0 → no cancel */
+    /* Read on successful activation (commit phase). */
+    blob_arr_t owned_tags;   /* uint16_t[] sorted ascending — apply: granted to caster */
+    blob_arr_t costs;        /* cost_entry_t[] — apply: attr deductions */
+    blob_arr_t cooldowns;    /* cooldown_entry_t[] — apply: synthetic cooldown effects */
+    /* Bytecode bodies — executed on activate / end events. */
     formula_t  on_activate;  /* uint32_t[] script bytecode */
     formula_t  on_end;
 } ability_def_t;
@@ -124,20 +151,22 @@ typedef struct {
    ========================================================================== */
 
 typedef struct {
-    uint64_t   schema_crc;
-    blob_arr_t tag_defs;     /* tag_def_t[] — kind + def_offset inline.
-                                 Each def reached via tag_defs[id].def_offset; no
+    /* HOT: read on every ctx setup (tick/event). */
+    blob_arr_t tag_defs;     /* tag_def_t[] — kind + def_offset packed inline.
+                                 Each def reached via tag_def_def_offset(); no
                                  flat ability/effect/prefab arrays. Lets codegen
                                  write each def adjacent to its own sub-data
                                  (queries, bytecode, owned_tags) for cache locality. */
+    /* COLD: read once at handshake / load. */
+    uint64_t   schema_crc;
 } script_blob_t;
 
 /* def_offset == 0 means "plain tag" — relies on script_blob_t sitting at
    offset 0 in the blob, so no real def can land there. Enforced by the
    compiler's allocator order (script_blob_t reserved first, tag_defs
-   second). Static-assert catches any future struct reshuffle that would
-   put a non-zero-offset field at the start. */
-_Static_assert(offsetof(script_blob_t, schema_crc) == 0,
+   array second). Static-assert catches any future struct reshuffle that
+   would put a non-zero-offset field at the start. */
+_Static_assert(offsetof(script_blob_t, tag_defs) == 0,
                "script_blob_t must start at offset 0 of the blob — "
                "def_offset==0 sentinel depends on this");
 
@@ -259,24 +288,24 @@ static inline const tag_def_t* script_tag_defs(const script_db_t* db) {
     return BLOB_ARR(&db->root->tag_defs, tag_def_t);
 }
 static inline const ability_def_t* ability_get_def(const script_db_t* db, uint16_t ability_tag) {
-    uint32_t off = script_tag_defs(db)[ability_tag].def_offset;
+    uint32_t off = tag_def_def_offset(&script_tag_defs(db)[ability_tag]);
     return (const ability_def_t*)((const uint8_t*)db->root + off);
 }
 static inline const prefab_def_t* prefab_get_def(const script_db_t* db, uint16_t prefab_tag) {
-    uint32_t off = script_tag_defs(db)[prefab_tag].def_offset;
+    uint32_t off = tag_def_def_offset(&script_tag_defs(db)[prefab_tag]);
     return (const prefab_def_t*)((const uint8_t*)db->root + off);
 }
 
 /* Hot-path variants — use cached pointers in ctx_t. Caller pre-derefed once.
-   2 derefs total (tag_defs[tag].def_offset). Preferred for tick / query / VM paths. */
+   2 derefs total (tag_defs[tag] + def_offset extract). Preferred for tick / query / VM paths. */
 static inline const ability_def_t* ability_get_def_ctx(const ctx_t* ctx, uint16_t tag) {
-    return (const ability_def_t*)(ctx->blob_base + ctx->tag_defs[tag].def_offset);
+    return (const ability_def_t*)(ctx->blob_base + tag_def_def_offset(&ctx->tag_defs[tag]));
 }
 static inline const effect_def_t* effect_get_def_ctx(const ctx_t* ctx, uint16_t tag) {
-    return (const effect_def_t*)(ctx->blob_base + ctx->tag_defs[tag].def_offset);
+    return (const effect_def_t*)(ctx->blob_base + tag_def_def_offset(&ctx->tag_defs[tag]));
 }
 static inline const prefab_def_t* prefab_get_def_ctx(const ctx_t* ctx, uint16_t tag) {
-    return (const prefab_def_t*)(ctx->blob_base + ctx->tag_defs[tag].def_offset);
+    return (const prefab_def_t*)(ctx->blob_base + tag_def_def_offset(&ctx->tag_defs[tag]));
 }
 
 /* ==========================================================================

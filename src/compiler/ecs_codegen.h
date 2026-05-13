@@ -75,11 +75,13 @@ prefab_def_t*  codegen_prefab_def (blob_writer_t* w, const void* blob_root,
                                    const ast_node_t* nodes, ast_idx_t prefab_node);
 
 #include "ecs_schema.h"
+#include "ecs_parser.h"
 
 /* Main driver — walk root's children, emit ability/effect/prefab arrays
-   into the blob, return pointers + counts. cg state owned internally. */
-/* Walk root's decls. For each decl, blob_alloc one def struct then write its
+   into the blob, return pointers + counts. cg state owned internally.
+   Walk root's decls. For each decl, blob_alloc one def struct then write its
    sub-data adjacent in the blob (queries, owned_tags, bytecode, etc.).
-   schema is mutated: each decl's def_offset is written to its schema_tag_t. */
-void codegen_run(blob_writer_t* w, const ast_arena_t* arena, ast_idx_t root,
+   schema is mutated: each decl's def_offset is written to its schema_tag_t.
+   parser owns the AST arena + tag_strs; both are read by codegen. */
+void codegen_run(blob_writer_t* w, const parser_t* parser, ast_idx_t root,
                  tag_schema_t* schema);

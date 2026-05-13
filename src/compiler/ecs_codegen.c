@@ -31,6 +31,7 @@ void blob_arr_set(blob_arr_t* field, void* target, uint32_t count) {
 typedef struct {
     blob_writer_t*       w;
     const ast_arena_t*   arena;
+    const parser_t*      parser;     /* owner of arena + tag_strs */
     tag_schema_t*        schema;
     /* Scratch bytecode buffer for current formula/script. */
     uint32_t*            bc;
@@ -107,10 +108,14 @@ static void reg_release_to(cg_t* c, uint8_t base) {
 }
 
 /* ==========================================================================
-   Tag hash → id resolution via schema.
+   Tag idx (parser-local) → schema id resolution.
+   AST nodes store an index into parser->tag_strs. Look up the (path, len)
+   pair, then ask the schema for the post-finalize id.
    ========================================================================== */
-static uint16_t resolve_tag(const cg_t* c, uint32_t hash) {
-    return tag_schema_id_of(c->schema, hash);
+static uint16_t resolve_tag(const cg_t* c, uint32_t idx) {
+    if (!c->parser || idx >= c->parser->tag_strs_count) return 0xFFFFu;
+    const tag_str_t* ts = &c->parser->tag_strs[idx];
+    return tag_schema_id_of_path(c->schema, ts->str, ts->len);
 }
 
 /* ==========================================================================
@@ -224,11 +229,11 @@ static uint8_t emit_expr(cg_t* c, ast_idx_t idx) {
     switch ((ast_kind_t)n->kind) {
         case AST_EXPR_LIT:  return emit_lit(c, n->u.lit);
         case AST_EXPR_ATTR: {
-            uint16_t tid = resolve_tag(c, n->u.attr.tag_hash);
+            uint16_t tid = resolve_tag(c, n->u.attr.tag_idx);
             return emit_attr_load(c, n->u.attr.subj, tid);
         }
         case AST_EXPR_PAYLOAD: {
-            uint16_t fid = resolve_tag(c, n->u.tag.tag_hash);
+            uint16_t fid = resolve_tag(c, n->u.tag.tag_idx);
             return emit_payload(c, fid);
         }
         case AST_EXPR_LOCAL:      return emit_local_load(c, n->u.local.local_idx);
@@ -322,7 +327,7 @@ static void emit_stmt(cg_t* c, ast_idx_t idx) {
         } break;
         case AST_EXPR_WAIT_EVENT: {
             if (c->pure_only) { c->errored = 1; break; }
-            uint16_t tid = resolve_tag(c, n->u.tag.tag_hash);
+            uint16_t tid = resolve_tag(c, n->u.tag.tag_idx);
             bc_emit(c, encode_iABx(OP_WAIT_EVENT, 0, tid));
             if (n->n_children >= 1 && ast_child(c->arena, idx, 0) != 0) {
                 uint8_t tor = emit_expr(c, ast_child(c->arena, idx, 0));
@@ -341,14 +346,14 @@ static void emit_stmt(cg_t* c, ast_idx_t idx) {
         } break;
         case AST_EXPR_EMIT: {
             if (c->pure_only) { c->errored = 1; break; }
-            uint16_t tid = resolve_tag(c, n->u.tag.tag_hash);
+            uint16_t tid = resolve_tag(c, n->u.tag.tag_idx);
             /* Emit field assigns into pending event payload (each is AST_EXPR_ASSIGN
-               with tag_hash + 1 child = value expr). */
+               with tag_idx + 1 child = value expr). */
             uint32_t nargs = n->n_children;
             for (uint32_t i = 0; i < nargs; i++) {
                 ast_idx_t fi = ast_child(c->arena, idx, i);
                 const ast_node_t* f = &c->arena->nodes[fi];
-                uint16_t ftag = resolve_tag(c, f->u.tag.tag_hash);
+                uint16_t ftag = resolve_tag(c, f->u.tag.tag_idx);
                 uint8_t  vr   = emit_expr(c, ast_child(c->arena, fi, 0));
                 bc_emit(c, encode_iABx(OP_STORE_PAYLOAD, vr, ftag));
                 reg_release_to(c, base);
@@ -357,17 +362,17 @@ static void emit_stmt(cg_t* c, ast_idx_t idx) {
         } break;
         case AST_EXPR_APPLY: {
             if (c->pure_only) { c->errored = 1; break; }
-            uint16_t tid = resolve_tag(c, n->u.tag.tag_hash);
+            uint16_t tid = resolve_tag(c, n->u.tag.tag_idx);
             bc_emit(c, encode_iABx(OP_APPLY_EFFECT, 0, tid));
         } break;
         case AST_EXPR_REMOVE: {
             if (c->pure_only) { c->errored = 1; break; }
-            uint16_t tid = resolve_tag(c, n->u.tag.tag_hash);
+            uint16_t tid = resolve_tag(c, n->u.tag.tag_idx);
             bc_emit(c, encode_iABx(OP_REMOVE_EFFECT, 0, tid));
         } break;
         case AST_EXPR_CANCEL: {
             if (c->pure_only) { c->errored = 1; break; }
-            uint16_t tid = resolve_tag(c, n->u.tag.tag_hash);
+            uint16_t tid = resolve_tag(c, n->u.tag.tag_idx);
             bc_emit(c, encode_iABx(OP_CANCEL_ABILITY, 0, tid));
         } break;
         case AST_EXPR_DESPAWN:
@@ -382,7 +387,7 @@ static void emit_stmt(cg_t* c, ast_idx_t idx) {
             uint8_t   vr = emit_expr(c, ri);
             const ast_node_t* lhs = &c->arena->nodes[li];
             if (lhs->kind == AST_EXPR_ATTR) {
-                uint16_t tid = resolve_tag(c, lhs->u.attr.tag_hash);
+                uint16_t tid = resolve_tag(c, lhs->u.attr.tag_idx);
                 ecs_op_t op  = lhs->u.attr.subj == SUBJ_TARGET ? OP_STORE_ATTR_T : OP_STORE_ATTR;
                 bc_emit(c, encode_iABx((uint8_t)op, vr, tid));
             } else if (lhs->kind == AST_EXPR_LOCAL) {
@@ -489,7 +494,7 @@ static uint32_t make_tag_clause(const cg_t* c, ast_idx_t clause_node) {
     const ast_node_t* n = &c->arena->nodes[clause_node];
     uint8_t  kind = (n->kind == AST_CLAUSE_TAG_EXACT) ? TAG_CL_EXACT : TAG_CL_HIERARCHICAL;
     uint8_t  subj = (uint8_t)n->u.attr.subj;
-    uint16_t tid  = resolve_tag(c, n->u.attr.tag_hash);
+    uint16_t tid  = resolve_tag(c, n->u.attr.tag_idx);
     return TAG_CL_MAKE(kind, subj, tid);
 }
 
@@ -572,7 +577,7 @@ static void fill_section_clauses(cg_t* c, ast_idx_t section_idx,
                 pc.subject           = (uint8_t)attr_side->u.attr.subj;
                 pc.cmp               = cmp_eff;
                 pc.kind              = PRED_KIND_IMM;
-                pc.u.imm.lhs_attr_tag = resolve_tag(c, attr_side->u.attr.tag_hash);
+                pc.u.imm.lhs_attr_tag = resolve_tag(c, attr_side->u.attr.tag_idx);
                 pc.u.imm.rhs_imm     = imm_val;
                 (*out_preds)[j++] = pc;
                 emitted_imm = 1;
@@ -668,7 +673,7 @@ static void cg_emit_tag_list_blob(cg_t* c, blob_arr_t* dst, ast_idx_t block_idx)
     if (!arr) return;
     for (uint32_t i = 0; i < n; i++) {
         ast_idx_t ci = ast_child(c->arena, block_idx, i);
-        arr[i] = resolve_tag(c, c->arena->nodes[ci].u.tag.tag_hash);
+        arr[i] = resolve_tag(c, c->arena->nodes[ci].u.tag.tag_idx);
     }
     blob_arr_set(dst, arr, n);
 }
@@ -723,9 +728,13 @@ tag_query_t* codegen_tag_query(blob_writer_t* w, const void* blob_root,
    Real driver — called by ecs_compiler.c. Builds an internal cg_t bound to
    the schema and emits each top-level decl into the blob.
    ========================================================================== */
-static schema_tag_t* schema_tag_by_hash(tag_schema_t* s, uint32_t hash) {
-    for (uint32_t i = 0; i < s->count; i++) if (s->tags[i].hash == hash) return &s->tags[i];
-    return NULL;
+/* Lookup the schema entry for an AST tag_idx (parser-local).
+   Used by decl emit paths that want to write back def_offset. Uses the
+   schema's 256-bucket hash index — O(1) amortized. */
+static schema_tag_t* schema_tag_by_idx(const cg_t* c, uint32_t idx) {
+    if (!c->parser || idx >= c->parser->tag_strs_count) return NULL;
+    const tag_str_t* ts = &c->parser->tag_strs[idx];
+    return tag_schema_find_path(c->schema, ts->str, ts->len);
 }
 
 static void emit_ability_decl(cg_t* c, ast_idx_t decl) {
@@ -733,7 +742,7 @@ static void emit_ability_decl(cg_t* c, ast_idx_t decl) {
     ability_def_t* d = (ability_def_t*)blob_alloc(c->w, sizeof(ability_def_t),
                                                     _Alignof(ability_def_t));
     if (!d) return;
-    schema_tag_t* st = schema_tag_by_hash(c->schema, dn->u.tag.tag_hash);
+    schema_tag_t* st = schema_tag_by_idx(c, dn->u.tag.tag_idx);
     if (st) st->def_offset = (uint32_t)((uint8_t*)d - c->w->base);
     ast_idx_t body = ast_child(c->arena, decl, 0);
     /* Hot-path write order — see ecs_codegen.h §4. */
@@ -748,7 +757,7 @@ static void emit_ability_decl(cg_t* c, ast_idx_t decl) {
         if (arr) {
             for (uint32_t k = 0; k < n; k++) {
                 ast_idx_t kv = ast_child(c->arena, cb, k);
-                arr[k].attr_tag = resolve_tag(c, c->arena->nodes[kv].u.tag.tag_hash);
+                arr[k].attr_tag = resolve_tag(c, c->arena->nodes[kv].u.tag.tag_idx);
                 uint32_t bcn = 0;
                 uint32_t* bc = cg_emit_formula(c, ast_child(c->arena, kv, 0), &bcn);
                 if (bc) blob_arr_set(&arr[k].cost, bc, bcn);
@@ -765,7 +774,7 @@ static void emit_ability_decl(cg_t* c, ast_idx_t decl) {
         if (arr) {
             for (uint32_t k = 0; k < n; k++) {
                 ast_idx_t kv = ast_child(c->arena, cdb, k);
-                arr[k].bucket_tag = resolve_tag(c, c->arena->nodes[kv].u.tag.tag_hash);
+                arr[k].bucket_tag = resolve_tag(c, c->arena->nodes[kv].u.tag.tag_idx);
                 uint32_t bcn = 0;
                 uint32_t* bc = cg_emit_formula(c, ast_child(c->arena, kv, 0), &bcn);
                 if (bc) blob_arr_set(&arr[k].duration, bc, bcn);
@@ -792,7 +801,7 @@ static void emit_effect_decl(cg_t* c, ast_idx_t decl) {
     effect_def_t* d = (effect_def_t*)blob_alloc(c->w, sizeof(effect_def_t),
                                                   _Alignof(effect_def_t));
     if (!d) return;
-    schema_tag_t* st = schema_tag_by_hash(c->schema, dn->u.tag.tag_hash);
+    schema_tag_t* st = schema_tag_by_idx(c, dn->u.tag.tag_idx);
     if (st) st->def_offset = (uint32_t)((uint8_t*)d - c->w->base);
     ast_idx_t body = ast_child(c->arena, decl, 0);
     /* Hot fields first (mirrors effect_def_t field order). */
@@ -823,7 +832,7 @@ static void emit_effect_decl(cg_t* c, ast_idx_t decl) {
             for (uint32_t k = 0; k < c->arena->nodes[body].n_children; k++) {
                 ast_idx_t bi = ast_child(c->arena, body, k);
                 if ((ast_kind_t)c->arena->nodes[bi].kind != AST_ON_HOOK) continue;
-                hd[hi].tag_in  = resolve_tag(c, c->arena->nodes[bi].u.tag.tag_hash);
+                hd[hi].tag_in  = resolve_tag(c, c->arena->nodes[bi].u.tag.tag_idx);
                 hd[hi].tag_out = 0;
                 uint32_t bcn = 0;
                 uint32_t* bc = cg_emit_script(c, ast_child(c->arena, bi, 0), &bcn);
@@ -840,7 +849,7 @@ static void emit_prefab_decl(cg_t* c, ast_idx_t decl) {
     prefab_def_t* d = (prefab_def_t*)blob_alloc(c->w, sizeof(prefab_def_t),
                                                   _Alignof(prefab_def_t));
     if (!d) return;
-    schema_tag_t* st = schema_tag_by_hash(c->schema, dn->u.tag.tag_hash);
+    schema_tag_t* st = schema_tag_by_idx(c, dn->u.tag.tag_idx);
     if (st) st->def_offset = (uint32_t)((uint8_t*)d - c->w->base);
     ast_idx_t body = ast_child(c->arena, decl, 0);
     cg_emit_tag_list_blob(c, &d->tags,      find_block(c, body, AST_BLOCK_TAGS));
@@ -855,7 +864,7 @@ static void emit_prefab_decl(cg_t* c, ast_idx_t decl) {
         if (arr) {
             for (uint32_t k = 0; k < n; k++) {
                 ast_idx_t kv = ast_child(c->arena, ab, k);
-                arr[k].attr_tag = resolve_tag(c, c->arena->nodes[kv].u.tag.tag_hash);
+                arr[k].attr_tag = resolve_tag(c, c->arena->nodes[kv].u.tag.tag_idx);
                 uint32_t bcn = 0;
                 uint32_t* bc = cg_emit_formula(c, ast_child(c->arena, kv, 0), &bcn);
                 if (bc) blob_arr_set(&arr[k].value, bc, bcn);
@@ -877,7 +886,7 @@ static void emit_prefab_decl(cg_t* c, ast_idx_t decl) {
             for (uint32_t k = 0; k < c->arena->nodes[body].n_children; k++) {
                 ast_idx_t bi = ast_child(c->arena, body, k);
                 if ((ast_kind_t)c->arena->nodes[bi].kind != AST_ON_HOOK) continue;
-                hd[hi].tag_in  = resolve_tag(c, c->arena->nodes[bi].u.tag.tag_hash);
+                hd[hi].tag_in  = resolve_tag(c, c->arena->nodes[bi].u.tag.tag_idx);
                 hd[hi].tag_out = 0;
                 uint32_t bcn = 0;
                 uint32_t* bc = cg_emit_script(c, ast_child(c->arena, bi, 0), &bcn);
@@ -889,11 +898,12 @@ static void emit_prefab_decl(cg_t* c, ast_idx_t decl) {
     }
 }
 
-void codegen_run(blob_writer_t* w, const ast_arena_t* arena, ast_idx_t root,
+void codegen_run(blob_writer_t* w, const parser_t* parser, ast_idx_t root,
                  tag_schema_t* schema) {
     cg_t c;
     memset(&c, 0, sizeof(c));
-    c.w = w; c.arena = arena; c.schema = schema;
+    c.w = w; c.parser = parser; c.arena = &parser->arena; c.schema = schema;
+    const ast_arena_t* arena = c.arena;
     const ast_node_t* rn = &arena->nodes[root];
     for (uint32_t i = 0; i < rn->n_children; i++) {
         ast_idx_t ci = ast_child(arena, root, i);

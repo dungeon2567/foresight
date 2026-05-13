@@ -5,34 +5,33 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ==========================================================================
-   FNV-1a 32-bit hash for tag paths. Stable and cheap; collision risk
-   negligible at typical tag counts (<10k).
-   ========================================================================== */
-static uint32_t fnv1a_hash(const char* s, uint32_t len) {
+/* 8-bit FNV-1a — bucket key only, never stored. */
+static inline uint8_t tag_bucket_of(const char* s, uint32_t len) {
     uint32_t h = 0x811c9dc5u;
-    for (uint32_t i = 0; i < len; i++) {
-        h ^= (uint8_t)s[i];
-        h *= 0x01000193u;
-    }
-    return h;
+    for (uint32_t i = 0; i < len; i++) { h ^= (uint8_t)s[i]; h *= 0x01000193u; }
+    return (uint8_t)(h ^ (h >> 8) ^ (h >> 16) ^ (h >> 24));
 }
 
-/* Intern a tag string in the parser's tag_strs table.
-   Returns the hash. Caller stores the hash in the AST node. */
+/* Intern a tag string by (str, len) equality. Returns the index — stored in
+   AST node u.tag.tag_idx / u.attr.tag_idx. Bucket-chained: O(1) amortized
+   even for thousands of refs (vs O(N^2) for linear scan). */
 static uint32_t intern_tag(parser_t* p, const char* s, uint32_t len) {
-    uint32_t h = fnv1a_hash(s, len);
-    /* Linear scan — tag counts per file are small (tens to hundreds). */
-    for (uint32_t i = 0; i < p->tag_strs_count; i++) {
-        if (p->tag_strs[i].hash == h) return h;
+    uint8_t bk = tag_bucket_of(s, len);
+    for (uint32_t i = p->tag_strs_head[bk]; i; i = p->tag_strs_next[i - 1]) {
+        const tag_str_t* t = &p->tag_strs[i - 1];
+        if (t->len == len && memcmp(t->str, s, len) == 0) return i - 1;
     }
     if (p->tag_strs_count >= p->tag_strs_cap) {
         uint32_t cap = p->tag_strs_cap ? p->tag_strs_cap * 2 : 64;
-        p->tag_strs = (tag_str_t*)ecs_xrealloc(p->tag_strs, cap * sizeof(tag_str_t));
-        p->tag_strs_cap = cap;
+        p->tag_strs      = (tag_str_t*)ecs_xrealloc(p->tag_strs,      cap * sizeof(tag_str_t));
+        p->tag_strs_next = (uint32_t*) ecs_xrealloc(p->tag_strs_next, cap * sizeof(uint32_t));
+        p->tag_strs_cap  = cap;
     }
-    p->tag_strs[p->tag_strs_count++] = (tag_str_t){ h, s, len };
-    return h;
+    uint32_t idx = p->tag_strs_count++;
+    p->tag_strs[idx]      = (tag_str_t){ s, len };
+    p->tag_strs_next[idx] = p->tag_strs_head[bk];
+    p->tag_strs_head[bk]  = idx + 1;
+    return idx;
 }
 
 /* ==========================================================================
@@ -156,28 +155,28 @@ static void kids_push(parse_ctx_t* c, ast_idx_t idx) {
    Forward decls.
    ========================================================================== */
 static ast_idx_t parse_decl     (parse_ctx_t* c);
-static ast_idx_t parse_prefab   (parse_ctx_t* c, uint32_t name_hash);
-static ast_idx_t parse_ability  (parse_ctx_t* c, uint32_t name_hash);
-static ast_idx_t parse_effect   (parse_ctx_t* c, uint32_t name_hash);
+static ast_idx_t parse_prefab   (parse_ctx_t* c, uint32_t name_idx);
+static ast_idx_t parse_ability  (parse_ctx_t* c, uint32_t name_idx);
+static ast_idx_t parse_effect   (parse_ctx_t* c, uint32_t name_idx);
 static ast_idx_t parse_block_body(parse_ctx_t* c, token_kind_t end);
 static ast_idx_t parse_query    (parse_ctx_t* c);
 static ast_idx_t parse_query_section(parse_ctx_t* c, ast_kind_t kind);
 static ast_idx_t parse_expr     (parse_ctx_t* c);
 static ast_idx_t parse_stmt     (parse_ctx_t* c);
-static ast_idx_t parse_tag_path (parse_ctx_t* c, uint32_t* out_hash);
+static ast_idx_t parse_tag_path (parse_ctx_t* c, uint32_t* out_idx);
 
 /* ==========================================================================
    Tag path: dotted identifier sequence. Lexer emits the full path as one
    TOK_IDENT (dots allowed in idents); just hash it.
    ========================================================================== */
-static ast_idx_t parse_tag_path(parse_ctx_t* c, uint32_t* out_hash) {
+static ast_idx_t parse_tag_path(parse_ctx_t* c, uint32_t* out_idx) {
     token_t t = peek(c->p);
     if (t.kind != TOK_IDENT) { error(c->p, "expected tag path"); return 0; }
     lexer_next(&c->p->lex);
     uint32_t h = intern_tag(c->p,t.start, t.len);
-    if (out_hash) *out_hash = h;
+    if (out_idx) *out_idx = h;
     ast_idx_t n = arena_alloc(&c->p->arena, AST_CLAUSE_TAG);
-    c->p->arena.nodes[n].u.tag.tag_hash = h;
+    c->p->arena.nodes[n].u.tag.tag_idx = h;
     return n;
 }
 
@@ -254,7 +253,7 @@ static ast_idx_t parse_primary(parse_ctx_t* c) {
         token_t name = expect(c->p, TOK_IDENT, "expected payload field");
         h = intern_tag(c->p,name.start, name.len);
         ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_PAYLOAD);
-        c->p->arena.nodes[n].u.tag.tag_hash = h;
+        c->p->arena.nodes[n].u.tag.tag_idx = h;
         return n;
     }
     /* locals[N] */
@@ -274,7 +273,7 @@ static ast_idx_t parse_primary(parse_ctx_t* c) {
         token_t name = expect(c->p, TOK_IDENT, "expected attr path");
         ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_ATTR);
         c->p->arena.nodes[n].u.attr.subj     = (ast_subject_t)subj;
-        c->p->arena.nodes[n].u.attr.tag_hash = intern_tag(c->p,name.start, name.len);
+        c->p->arena.nodes[n].u.attr.tag_idx = intern_tag(c->p,name.start, name.len);
         return n;
     }
     /* Builtin function call: ident(args...) */
@@ -317,7 +316,7 @@ static ast_idx_t parse_primary(parse_ctx_t* c) {
            as an attr on implicit self — defer to caller via tag-hash node. */
         ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_ATTR);
         c->p->arena.nodes[n].u.attr.subj     = SUBJ_SELF;
-        c->p->arena.nodes[n].u.attr.tag_hash = intern_tag(c->p,t.start, t.len);
+        c->p->arena.nodes[n].u.attr.tag_idx = intern_tag(c->p,t.start, t.len);
         return n;
     }
     error(c->p, "expected expression");
@@ -434,7 +433,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
             uint32_t h = 0;
             (void)parse_tag_path(c, &h);
             ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_WAIT_EVENT);
-            c->p->arena.nodes[n].u.tag.tag_hash = h;
+            c->p->arena.nodes[n].u.tag.tag_idx = h;
             ast_idx_t timeout = 0;
             if (match(c->p, TOK_KW_TIMEOUT)) timeout = parse_expr(c);
             ast_idx_t kids[1] = { timeout };
@@ -458,7 +457,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
             uint32_t h = 0;
             (void)parse_tag_path(c, &h);
             ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_EMIT);
-            c->p->arena.nodes[n].u.tag.tag_hash = h;
+            c->p->arena.nodes[n].u.tag.tag_idx = h;
             /* Optional payload: (k1 = v1, k2 = v2). */
             if (match(c->p, TOK_LPAREN)) {
                 uint32_t saved = c->kids_count;
@@ -468,7 +467,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
                         expect(c->p, TOK_ASSIGN, "expected '='");
                         ast_idx_t v = parse_expr(c);
                         ast_idx_t fk = arena_alloc(&c->p->arena, AST_EXPR_ASSIGN);
-                        c->p->arena.nodes[fk].u.tag.tag_hash = intern_tag(c->p,name.start, name.len);
+                        c->p->arena.nodes[fk].u.tag.tag_idx = intern_tag(c->p,name.start, name.len);
                         ast_idx_t kk[1] = { v };
                         set_children(&c->p->arena, fk, kk, 1);
                         kids_push(c, fk);
@@ -485,7 +484,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
             uint32_t h = 0;
             (void)parse_tag_path(c, &h);
             ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_APPLY);
-            c->p->arena.nodes[n].u.tag.tag_hash = h;
+            c->p->arena.nodes[n].u.tag.tag_idx = h;
             return n;
         }
         case TOK_KW_REMOVE: {
@@ -493,7 +492,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
             uint32_t h = 0;
             (void)parse_tag_path(c, &h);
             ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_REMOVE);
-            c->p->arena.nodes[n].u.tag.tag_hash = h;
+            c->p->arena.nodes[n].u.tag.tag_idx = h;
             return n;
         }
         case TOK_KW_CANCEL: {
@@ -501,7 +500,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
             uint32_t h = 0;
             (void)parse_tag_path(c, &h);
             ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_CANCEL);
-            c->p->arena.nodes[n].u.tag.tag_hash = h;
+            c->p->arena.nodes[n].u.tag.tag_idx = h;
             return n;
         }
         case TOK_KW_DESPAWN: lexer_next(&c->p->lex); return arena_alloc(&c->p->arena, AST_EXPR_DESPAWN);
@@ -510,7 +509,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
             uint32_t h = 0;
             (void)parse_tag_path(c, &h);
             ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_SPAWN);
-            c->p->arena.nodes[n].u.tag.tag_hash = h;
+            c->p->arena.nodes[n].u.tag.tag_idx = h;
             return n;
         }
         case TOK_LBRACE: return parse_block_stmts(c);
@@ -556,7 +555,7 @@ static ast_idx_t parse_tag_clause(parse_ctx_t* c) {
     h = intern_tag(c->p,t.start, t.len);
     ast_idx_t n = arena_alloc(&c->p->arena, exact ? AST_CLAUSE_TAG_EXACT : AST_CLAUSE_TAG);
     c->p->arena.nodes[n].u.attr.subj     = (ast_subject_t)subj;
-    c->p->arena.nodes[n].u.attr.tag_hash = h;
+    c->p->arena.nodes[n].u.attr.tag_idx = h;
     return n;
 }
 
@@ -654,7 +653,7 @@ static ast_idx_t parse_kv_block(parse_ctx_t* c, ast_kind_t kind) {
         expect(c->p, TOK_ASSIGN, "expected '='");
         ast_idx_t v  = parse_expr(c);
         ast_idx_t kv = arena_alloc(&c->p->arena, AST_EXPR_ASSIGN);
-        c->p->arena.nodes[kv].u.tag.tag_hash = intern_tag(c->p,name.start, name.len);
+        c->p->arena.nodes[kv].u.tag.tag_idx = intern_tag(c->p,name.start, name.len);
         ast_idx_t kk[1] = { v };
         set_children(&c->p->arena, kv, kk, 1);
         kids_push(c, kv);
@@ -688,7 +687,7 @@ static ast_idx_t parse_on_hook(parse_ctx_t* c) {
     h = intern_tag(c->p,t.start, t.len);
     ast_idx_t body = parse_block_stmts(c);
     ast_idx_t n = arena_alloc(&c->p->arena, AST_ON_HOOK);
-    c->p->arena.nodes[n].u.tag.tag_hash = h;
+    c->p->arena.nodes[n].u.tag.tag_idx = h;
     ast_idx_t kk[1] = { body };
     set_children(&c->p->arena, n, kk, 1);
     return n;
@@ -763,37 +762,96 @@ static ast_idx_t parse_body_block(parse_ctx_t* c) {
 /* ==========================================================================
    Top-level declarations.
    ========================================================================== */
-static ast_idx_t parse_prefab(parse_ctx_t* c, uint32_t name_hash) {
+static ast_idx_t parse_prefab(parse_ctx_t* c, uint32_t name_idx) {
     ast_idx_t body = parse_body_block(c);
     ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_PREFAB);
-    c->p->arena.nodes[n].u.tag.tag_hash = name_hash;
+    c->p->arena.nodes[n].u.tag.tag_idx = name_idx;
     ast_idx_t kk[1] = { body };
     set_children(&c->p->arena, n, kk, 1);
     return n;
 }
 
-static ast_idx_t parse_ability(parse_ctx_t* c, uint32_t name_hash) {
+static ast_idx_t parse_ability(parse_ctx_t* c, uint32_t name_idx) {
     ast_idx_t body = parse_body_block(c);
     ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_ABILITY);
-    c->p->arena.nodes[n].u.tag.tag_hash = name_hash;
+    c->p->arena.nodes[n].u.tag.tag_idx = name_idx;
     ast_idx_t kk[1] = { body };
     set_children(&c->p->arena, n, kk, 1);
     return n;
 }
 
-static ast_idx_t parse_effect(parse_ctx_t* c, uint32_t name_hash) {
+static ast_idx_t parse_effect(parse_ctx_t* c, uint32_t name_idx) {
     ast_idx_t body = parse_body_block(c);
     ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_EFFECT);
-    c->p->arena.nodes[n].u.tag.tag_hash = name_hash;
+    c->p->arena.nodes[n].u.tag.tag_idx = name_idx;
     ast_idx_t kk[1] = { body };
     set_children(&c->p->arena, n, kk, 1);
+    return n;
+}
+
+/* commands { [command] tag.path , ... } — anonymous top-level decl.
+   Optional `command` keyword before each entry is accepted as documentation
+   and stripped here. Each entry interned as a normal tag. */
+static ast_idx_t parse_commands(parse_ctx_t* c) {
+    lexer_next(&c->p->lex);                      /* consume `commands` */
+    expect(c->p, TOK_LBRACE, "expected '{'");
+    uint32_t saved = c->kids_count;
+    while (!check(c->p, TOK_RBRACE) && !check(c->p, TOK_EOF)) {
+        /* Optional `command` prefix. */
+        if (check(c->p, TOK_KW_COMMAND)) lexer_next(&c->p->lex);
+        uint32_t h = 0;
+        ast_idx_t tn = parse_tag_path(c, &h);
+        kids_push(c, tn);
+        match(c->p, TOK_COMMA);
+        match(c->p, TOK_SEMICOLON);
+    }
+    expect(c->p, TOK_RBRACE, "expected '}'");
+    ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_COMMANDS);
+    set_children(&c->p->arena, n, &c->kids_buf[saved], c->kids_count - saved);
+    c->kids_count = saved;
+    return n;
+}
+
+/* input { (button|stick) name , ... } — anonymous top-level decl.
+   One global per-game; emits AST_INPUT_BUTTON / AST_INPUT_STICK children,
+   each carrying the slot's interned tag idx. */
+static ast_idx_t parse_input(parse_ctx_t* c) {
+    lexer_next(&c->p->lex);                      /* consume `input` */
+    expect(c->p, TOK_LBRACE, "expected '{'");
+    uint32_t saved = c->kids_count;
+    while (!check(c->p, TOK_RBRACE) && !check(c->p, TOK_EOF)) {
+        token_kind_t k = peek(c->p).kind;
+        ast_kind_t   ak;
+        if (k == TOK_KW_BUTTON)      ak = AST_INPUT_BUTTON;
+        else if (k == TOK_KW_STICK)  ak = AST_INPUT_STICK;
+        else {
+            error(c->p, "expected 'button' or 'stick'");
+            consume(c->p);
+            continue;
+        }
+        lexer_next(&c->p->lex);
+        token_t name = expect(c->p, TOK_IDENT, "expected slot name");
+        uint32_t h = intern_tag(c->p, name.start, name.len);
+        ast_idx_t entry = arena_alloc(&c->p->arena, ak);
+        c->p->arena.nodes[entry].u.tag.tag_idx = h;
+        kids_push(c, entry);
+        match(c->p, TOK_COMMA);
+        match(c->p, TOK_SEMICOLON);
+    }
+    expect(c->p, TOK_RBRACE, "expected '}'");
+    ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_INPUT);
+    set_children(&c->p->arena, n, &c->kids_buf[saved], c->kids_count - saved);
+    c->kids_count = saved;
     return n;
 }
 
 static ast_idx_t parse_decl(parse_ctx_t* c) {
     token_kind_t k = peek(c->p).kind;
+    /* Anonymous top-level decls (no name token). */
+    if (k == TOK_KW_COMMANDS) return parse_commands(c);
+    if (k == TOK_KW_INPUT)    return parse_input(c);
     if (k != TOK_KW_PREFAB && k != TOK_KW_ABILITY && k != TOK_KW_EFFECT) {
-        error(c->p, "expected 'prefab', 'ability', or 'effect'");
+        error(c->p, "expected 'prefab', 'ability', 'effect', 'commands', or 'input'");
         consume(c->p);
         return 0;
     }
@@ -821,6 +879,7 @@ void parser_destroy(parser_t* p) {
     ecs_free(p->arena.nodes);       p->arena.nodes = NULL;
     ecs_free(p->arena.child_runs);  p->arena.child_runs = NULL;
     ecs_free(p->tag_strs);          p->tag_strs    = NULL;
+    ecs_free(p->tag_strs_next);     p->tag_strs_next = NULL;
     p->arena.count = p->arena.cap = 0;
     p->arena.child_runs_count = p->arena.child_runs_cap = 0;
     p->tag_strs_count = p->tag_strs_cap = 0;

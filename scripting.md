@@ -210,6 +210,439 @@ Read remaining cooldown ticks with the builtin `cooldown_remaining(self,
 TAG)` — returns 0 if the exact tag is not currently on the entity, else
 `end_tick - now`.
 
+### 2.6 Input + Commands
+
+Gameplay scripts read player intent through two related surfaces:
+
+- **`commands { }`** — top-level decl listing command tag names. Each entry
+  registers a tag in the global namespace; commands are routable events,
+  typically emitted by the input layer and consumed by `on <command>` hooks.
+- **`input { }`** — top-level (per-game) block declaring the input layout
+  the engine writes once per connected player per tick (before scripts
+  run). Holds buttons + 2D sticks bit-packed in a deterministic record.
+
+#### commands
+
+```
+commands {
+    fire
+    jump
+    move
+    ability.fireball
+    ability.iceblast
+}
+```
+
+Each entry becomes a tag (subject to ancestor promotion: `ability.fireball`
+also promotes `ability`). Dotted paths follow the same hierarchical-match
+rules as any other tag — `on ability { ... }` catches every ability command.
+
+Commands are *just tags* — the `commands { }` block is documentation +
+namespace anchor; no special wire format. The optional `command` keyword
+before an entry is accepted as a style hint and ignored by codegen:
+
+```
+commands {
+    command fire           // equivalent to bare `fire`
+    command ability.fireball
+}
+```
+
+Commands map to input slots (next section) or are emitted directly by
+script code (`emit ability.fireball`). Either way they flow through the
+normal event dispatch path (§ 13.3 step 5).
+
+#### input
+
+**Top-level decl, one per game.** Input is owned by the *player*, not by
+any prefab — one connected player produces one input record per tick,
+regardless of which entities they currently control. Multiple entities
+may read the same player's input; one player can control many entities.
+
+```
+input {
+    button fire
+    button jump
+    button crouch
+    stick  move
+    stick  aim
+}
+```
+
+Slot names are tags (full dotted paths allowed: `button weapon.primary.fire`).
+They live in the same global tag table as everything else.
+
+The engine maintains one record per connected player, slotted into the
+existing `ecs_input.h` table. Scripts read `input.<slot>.<sub>` from any
+prefab body; the resolution `entity → player → input record` is performed
+by engine code (e.g. an `owner_player_id` component on the entity, set
+when the player possesses the prefab). The language is agnostic to that
+mapping — `input.X` always means *the current entity's owning player*.
+
+```
+prefab player {
+    on input.fire.pressed {       // resolves against self's owning player
+        emit ability.fireball
+    }
+
+    on input.move.changed {
+        // move.x / move.y now reflect the new stick position
+    }
+}
+```
+
+##### `button` slots — 1 wire bit, 2 memory bits, 3 derived states
+
+Per button per tick:
+
+- **Wire**: `1` bit — only `down` (current frame).
+- **Memory**: `2` bits — `down` (current) + `was_down` (previous frame).
+  `was_down` is engine-local; never crosses the network.
+
+Three derived states cover all use cases:
+
+| Access                  | Formula            | Notes                            |
+|-------------------------|--------------------|----------------------------------|
+| `input.fire.down`       | down               | held this tick                   |
+| `input.fire.pressed`    | down & !was_down   | rising edge (0→1 this tick)      |
+| `input.fire.released`   | !down & was_down   | falling edge (1→0 this tick)     |
+
+State table for the raw bit-pair `(down, was_down)`:
+
+| down | was_down | label   | pressed | down (out) | released |
+|:----:|:--------:|---------|:-------:|:----------:|:--------:|
+| 0    | 0        | idle    |    0    |     0      |    0     |
+| 1    | 0        | rising  |    1    |     1      |    0     |
+| 1    | 1        | held    |    0    |     1      |    0     |
+| 0    | 1        | falling |    0    |     0      |    1     |
+
+Returns `fixed_t` 0 / `FIXED_ONE`. Codegen emits one byte-load + bit-mask
++ compare per access.
+
+**Memory layout** — buttons sit at exact bit offsets in the record. No
+byte padding between sections:
+
+```
+bit-offset 0   → down section     [ N bits ]
+bit-offset N   → was_down section [ N bits ]
+```
+
+Slot index inside each section = declaration order (0..N−1). Codegen
+resolves each named slot to a bit offset at compile time:
+- `down_bit_i  = i`
+- `wasd_bit_i  = N + i`
+
+**Edge derivation**: `pressed` / `released` are pure functions of the two
+memory bits — no separate wire bits. Codegen emits one bit-extract per
+side + AND/NAND.
+
+**Tick-roll** (engine-side, before applying the new wire frame): copy
+bits `[0..N)` to bits `[N..2N)` — `was_down := down` for all slots in one
+bitstream-copy.
+- N % 8 == 0 → single `memcpy(record + N/8, record, N/8)`.
+- otherwise   → one `read_bits(N)` + `write_bits(N)` against
+  `ecs_serializer.h` helpers (handles up to 64 bits in one shot;
+  multi-word loop for larger N).
+
+After tick-roll, the engine deserializes the wire's `N` `down` bits
+directly into the down section, overwriting them. The was_down section
+already holds last frame's down — left untouched by the wire decode.
+
+##### `stick` slots — cartesian Q1.15, 32 bits, lossless
+
+Sticks are **always normalized** (engine deadzones + radial-clamps at
+the input boundary, magnitude ≤ 1) and encoded as a single fixed format:
+
+```
+input {
+    stick move
+    stick aim
+}
+```
+
+Each stick is **32 bits** in declaration order:
+
+| Field | Bits | Encoding                          | Range / resolution            |
+|-------|-----:|-----------------------------------|-------------------------------|
+| x     |   16 | signed Q1.15                      | `[-1, +1)`, step `1 / 32768`  |
+| y     |   16 | signed Q1.15                      | `[-1, +1)`, step `1 / 32768`  |
+
+**Lossless across the entire pipeline**: 16-bit signed-int captures the
+full precision of any commodity joystick ADC (typically 8–12 bits).
+Wire bits, in-memory bits, and ADC bits carry identical information —
+no encoding transform, no rounding, no quantization beyond what the
+hardware itself produces.
+
+Single format. No precision classes, no polar / cartesian split, no
+LUTs. Tightens codegen + decoder.
+
+##### Stick script access
+
+| Access                    | Type     | Notes                                                |
+|---------------------------|----------|------------------------------------------------------|
+| `input.move.x`            | fixed_t  | direct: signed Q1.15 sign-extended + shifted to Q16.16 |
+| `input.move.y`            | fixed_t  | direct: same                                          |
+| `input.move.magnitude`    | fixed_t  | `sqrt(x² + y²)`; lazy + cached per tick               |
+| `input.move.angle`        | fixed_t  | `atan2(y, x)`, Q16.16 radians; lazy + cached          |
+| `input.move.changed`      | fixed_t  | 0/1, set when raw bits differ from previous frame    |
+
+`x` and `y` are **direct field reads — zero conversion cost** (one
+signed shift). `magnitude` and `angle` are computed lazily on first
+access per tick (integer sqrt + atan2, deterministic) and cached.
+
+**Determinism**: integer-only — Q1.15 → Q16.16 is a sign-extending
+shift; sqrt + atan2 use fixed-point integer implementations from
+`ecs_fixed.h`. Same bits in → same fixed_t out across architectures
+and rollback. No floating point, no transcendental LUTs.
+
+##### Wire format
+
+Buttons + sticks share one opaque payload per player, slotted into the
+existing `ecs_input.h` table (one command type_id for the whole game's
+input layout). The payload is a **pure bitstream — only the `down` bit
+per button; no `was_down`, no padding between sections, no padding
+inside sticks**:
+
+```
+bit 0      N                                                 N + 32M
+ |          |                                                       |
+ v          v                                                       v
+ [ down N  ][ x0:16 | y0:16 | x1:16 | y1:16 | ... | xM-1:16 | yM-1:16 ]
+```
+
+- `N` = button count
+- `M` = stick count
+- Each stick contributes exactly **32 bits**: signed Q1.15 `x` (16 bits)
+  followed by signed Q1.15 `y` (16 bits). Sticks concatenated in
+  declaration order, no padding.
+- Slot index within each section = declaration order
+
+**Exact wire bit length**: `bit_len = N + 32*M`. Registered with
+`ecs_input_register_cmd_type(registry, type_id, bit_len)` so the decoder
+knows the size without a per-command header. `was_down` is reconstructed
+locally each tick from last frame's `down`; never transmitted.
+
+**Record layout in the input BUFFER tree** — `ceil((2*N + 32*M) / 8)`
+bytes per player (memory holds both `down` and `was_down`). Bit offsets:
+
+| Slot                  | Bit offset            | Bit width |
+|-----------------------|-----------------------|-----------|
+| `button.down[i]`      | `i`                   | 1         |
+| `button.wasd[i]`      | `N + i`               | 1         |
+| `stick[i].x`          | `2*N + 32*i`          | 16 (signed Q1.15) |
+| `stick[i].y`          | `2*N + 32*i + 16`     | 16 (signed Q1.15) |
+
+**Memory stride**: `ceil((2*N + 32*M) / 8)` bytes per player.
+**Wire bit_len**: `N + 32*M` (down + sticks only).
+
+A few concrete sizes:
+
+| Layout                | wire bit_len | wire bytes (P=1, no framing) | memory stride |
+|-----------------------|-------------:|-----------------------------:|--------------:|
+| 1 button, 0 sticks    |            1 |                          1 B |           1 B |
+| 3 buttons, 0 sticks   |            3 |                          1 B |           1 B |
+| 4 buttons, 1 stick    |           36 |                          5 B |           5 B |
+| 8 buttons, 1 stick    |           40 |                          5 B |           6 B |
+| 8 buttons, 2 sticks   |           72 |                          9 B |          10 B |
+| 16 buttons, 2 sticks  |           80 |                         10 B |          12 B |
+| 1 button, 1 stick     |           33 |                          5 B |           5 B |
+
+`N == 0` → button sections omitted; `M == 0` → stick section omitted.
+An empty `input { }` block (no slots) produces no record at all.
+
+**Unaligned bit-field reads**: stick `x` / `y` (16 bits each) rarely
+land on byte boundaries when N is not a multiple of 8. Codegen emits
+`read_bits(16)` + sign-extend per field; `ecs_serializer.h` already
+implements this. Cost is ~2 byte-loads + shifts per read — same as a
+plain unaligned `int16_t` load on x86.
+
+Layout is purely a function of the (single) `input { }` decl →
+deterministic across builds and identical for every connected player.
+
+##### Codegen-emitted I/O
+
+For the single `input { }` decl, the compiler emits four helpers + a
+typed in-memory struct (one shared type for every player). All paths
+are pure integer bit-ops → **bit-identical across architectures and
+rollback**.
+
+```c
+/* In-memory representation: same bitstream as wire (zero-copy).
+   Stride = ceil((2*N + 32*M) / 8). One instance per connected player. */
+typedef struct { uint8_t bits[PLAYER_INPUT_STRIDE]; } player_input_t;
+
+/* Wire I/O — both sides of the netcode boundary call these. */
+void player_input_read (ecs_deserializer_t* d,       player_input_t* out);
+void player_input_write(ecs_serializer_t*   s, const player_input_t* in);
+
+/* Tick-begin roll: copies down section onto was_down section.
+   Bit-copy when N is not byte-aligned, single memcpy when it is. */
+void player_input_tick_roll(player_input_t* state);
+
+/* Per-slot accessors — inlined into script bytecode lowering.
+   `i` is the compile-time slot index baked by codegen. Called via
+   `input.<slot>.<sub>` against the current entity's owning player. */
+static inline uint32_t player_input_btn_down    (const player_input_t* s, uint32_t i);
+static inline uint32_t player_input_btn_pressed (const player_input_t* s, uint32_t i);
+static inline uint32_t player_input_btn_released(const player_input_t* s, uint32_t i);
+static inline fixed_t  player_input_stick_x     (const player_input_t* s, uint32_t i);
+static inline fixed_t  player_input_stick_y     (const player_input_t* s, uint32_t i);
+static inline fixed_t  player_input_stick_mag   (const player_input_t* s, uint32_t i);
+static inline fixed_t  player_input_stick_angle (const player_input_t* s, uint32_t i);
+```
+
+`*_read` / `*_write` use `ecs_serializer.h`'s `read_bits` / `write_bits`
+on the same bitstream layout documented above. Because in-memory = wire
+format, the implementation degenerates to a single `memcpy` once the
+deserializer's bit cursor is byte-aligned (the common case for the head
+of a multi-player packet).
+
+###### Wire is bit-exact, memory is byte-stride
+
+Two separate notions of "size":
+
+- **Wire**: pure bit-stream. Each player's record occupies exactly
+  `bit_len = 2*N + 32*M` bits — **no byte padding between players**.
+  Multi-player packets concatenate records bit-contiguously; only the
+  whole packet rounds up to a byte boundary at the very end.
+
+- **Memory**: each `player_input_t` is a stand-alone record sized to
+  `stride = ceil(bit_len / 8)` bytes (byte-aligned, normal C struct). The
+  last byte may contain up to 7 zero padding bits in the slot positions
+  past `bit_len` — they carry no information and are never read.
+
+The two representations carry **identical information** (same bits in
+slot order); only the framing differs. No quantization, no precision
+loss between network and RAM.
+
+`*_read` advances the deserializer by exactly `bit_len` bits per player,
+not by `stride * 8` — the wire never wastes the trailing padding bits.
+When `bit_len % 8 == 0` and the cursor happens to be byte-aligned, the
+read degenerates to a `memcpy`; otherwise it's a few `read_bits` calls.
+
+Rollback shadow per player = `stride` bytes (tight; trailing pad is
+free).
+
+##### Netcode packing
+
+Records are bit-tight on the wire. Multi-player packets = **bit-contiguous
+concatenation, no byte gaps between players, no per-player framing**.
+Sender + receiver agree on `(player_count, input_layout)` via the session
+handshake; ordering implies player ID. One `tick_id` per packet at the
+front. Whole packet rounds up to byte boundary once at the end.
+
+```
+bit 0      16          16+bit_len    16+2*bit_len      16+P*bit_len
+ |          |                |             |                 |
+ v          v                v             v                 v
+ [tick_id:16][player_0:bit_len][player_1:bit_len]...[player_P-1:bit_len][pad:0..7]
+```
+
+Packet byte size = `ceil((16 + P * bit_len) / 8)`.
+
+For desync detection / server reconciliation, append per-player
+coordinates after the input block (or interleave — choice of binding):
+
+```
+[ tick_id : 16 ]  [ inputs : P × bit_len ]  [ coords : P × coord_bits ]
+```
+
+Coordinates: typical encodings (Q.K signed fixed-point):
+
+| Encoding             | Bits / axis | Range          | Resolution     | Use                  |
+|----------------------|------------:|----------------|----------------|----------------------|
+| Q.10                 |          10 | ±512           | 1.0            | grid / tile worlds   |
+| Q.14                 |          14 | ±128.0         | 1 / 256        | bounded arena        |
+| Q.16                 |          16 | ±256.0         | 1 / 256        | typical 2D / 3D play |
+| Q.20                 |          20 | ±2048.0        | 1 / 256        | open-world           |
+| Q16.16 (engine native)|        32 | full fixed_t   | 1 / 65536      | replay / authoritative |
+
+Game picks `coord_bits` per axis and per dimension (2D = 2 × per axis,
+3D = 3 ×). Deltas from last-acked reduce typical wire cost ~3×.
+
+**Sizing table** — bits / bytes per player per tick, plus packet totals
+at 60 Hz for P players. Tick framing + UDP/IP overhead not counted
+(~28 B per datagram).
+
+All numbers are **wire** bits per player (only `down` for buttons, no
+`was_down`).
+
+| Composition (per player)                | Wire bits | Bytes if standalone |
+|------------------------------------------|----------:|---------------------:|
+| 4 buttons                                |         4 |                 1 B |
+| 8 buttons                                |         8 |                 1 B |
+| 16 buttons                               |        16 |                 2 B |
+| 1 stick                                  |        32 |                 4 B |
+| 2 sticks                                 |        64 |                 8 B |
+| 8 buttons + 1 stick                      |        40 |                 5 B |
+| 8 buttons + 2 sticks                     |        72 |                 9 B |
+| 16 buttons + 2 sticks                    |        80 |                10 B |
+| 8 buttons + 2 sticks + 2D pos Q.14       |       100 |                13 B |
+| 8 buttons + 2 sticks + 3D pos Q.16       |       120 |                15 B |
+| 16 buttons + 2 sticks + 3D pos Q.20      |       140 |                18 B |
+
+**Multi-player packets** — packet bytes for P players + 16-bit tick_id
+(rounded up at the end, packing is bit-contiguous):
+
+All players inside one packet are bit-contiguous (`(16 + P * bit_len)`
+bits total, rounded up to bytes once). bit_len per row:
+- 8 btn + 1 stick: 40 bits
+- 16 btn + 2 sticks: 80 bits
+- 16 btn + 2 sticks + 3D pos Q.16: 128 bits
+
+| Players | 8 btn + 1 stick | 16 btn + 2 stick | + 3D pos Q.16 |
+|--------:|----------------:|-----------------:|--------------:|
+| 1       |             7 B |             12 B |          18 B |
+| 2       |            12 B |             22 B |          34 B |
+| 4       |            22 B |             42 B |          66 B |
+| 8       |            42 B |             82 B |         130 B |
+| 16      |            82 B |            162 B |         258 B |
+
+At 60 Hz, 16 players × (16 buttons + 2 sticks + 3D pos Q.16): `258 × 60
+≈ 15.5 KB/s = 124 kbit/s`. Halved with delta-from-last-acked
+(≈ 62 kbit/s). Within a single UDP datagram (MTU ~1500 B) → no
+fragmentation through ~92 players.
+
+**Notes**:
+- No per-player ID in packet — derived from ordering or session handshake.
+- `ecs_input.h` already supports `bit_len`-exact command types + delta-stream
+  compression (`in_write_payload_bits` / `in_write_cmd_bits`).
+- Tick advance (delta-only frames where nothing changed) costs a single
+  bit per player via the `1` ↔ `0` change-bit in the existing protocol.
+
+##### Routing input → commands
+
+The default pattern is `on input.<slot>.pressed` etc. — direct slot
+edge hooks. For cross-prefab dispatch, scripts can convert any input edge
+into a command tag via `emit`:
+
+```
+input { button fire }
+
+prefab player {
+    on input.fire.pressed {
+        emit ability.fireball     // routes through normal event dispatch
+    }
+}
+```
+
+This keeps the wire surface (per-player input records) and the routing
+surface (command tags) separable. Commands listed in `commands { }` are
+expected to be reachable this way.
+
+##### Determinism
+
+Input frames roll back with the rest of the simulation — buttons + sticks
+are deterministic per the engine's predict/rollback model. Re-simulated
+frames see the same `pressed` / `released` / `x` / `y` values given the
+same input stream. `magnitude` / `angle` cache is rebuilt per tick from
+the raw `x` / `y` so it never diverges across rollback.
+
+##### Reserved keywords
+
+`commands`, `input`, `command`, `button`, `stick` — added to the
+reserved-keyword set (§ 15). Cannot be used as user tag names.
+
 ---
 
 ## 3. Examples
@@ -610,15 +1043,19 @@ Same source → identical output, byte-stable.
 ```c
 typedef struct {
     uint16_t parent;       // 0xFFFF = root
-    uint16_t out;           // first ID that is NOT a descendant of this tag
-    uint32_t name_hash;     // CRC32 of full path; for save/load remap
-} tag_def_t;
+    uint16_t out;          // first ID that is NOT a descendant of this tag
+    uint32_t def_offset;   // blob offset to def struct (0 = plain tag)
+    uint32_t name_offset;  // blob offset to path bytes (cold string table)
+    uint16_t name_len;     // path byte length, no NUL
+    uint8_t  kind;         // tag_kind_t
+} tag_def_t;               // 16 bytes
 
 extern tag_def_t tag_defs[N];   // N = total tags, <= 65536
 ```
 
-`in` is implicit (equals the array index). 8 bytes × N. For N = 65536 → 512KB
-static data — fine.
+`in` is implicit (equals the array index). 16 bytes × N. For N = 65536 → 1 MB
+static data — fine. Path bytes (`name_offset`-addressed) live in the blob's
+cold tail, concatenated raw without separators.
 
 A parallel `tag_meta[]` table indexed by tag id holds decl-kind information
 (prefab idx, ability idx, effect idx); most slots are zero.
@@ -633,7 +1070,8 @@ Every build that consumes the same source file set produces:
 - Identical bytecode (op IDs use same tag IDs).
 
 `schema_crc` is stamped into world saves and the network handshake. Mismatch =
-rebuild required; saves remap via `name_hash`.
+rebuild required; saves remap by comparing the saved path strings against
+the new `tag_defs[].name_offset`/`name_len` table.
 
 ---
 
@@ -1590,11 +2028,12 @@ All steps registered through `ecs_pipeline_t`. No runtime allocation per tick.
 
 ## 14. Schema versioning + saves
 
-- Save header includes `schema_crc` and a `name_hash[]` index for every tag
-  ID present in the save.
+- Save header includes `schema_crc` and the full path string for every tag
+  ID present in the save (read from the blob's string table at save time).
 - Load:
   - If `schema_crc == current_schema_crc` → fast path, ship raw IDs.
-  - Else build `name_hash → new_id` from current `tag_defs[]`, walk every
+  - Else build `path → new_id` by walking the current `tag_defs[]` (each
+    entry's name reachable via `tag_def_name(blob, &def, &len)`); walk every
     BUFFER tree (`entity_tags`, `attr_mods`, `entity_effects`, `entity_handlers`,
     `entity_abilities`) and remap u16s.
 - Network: peers exchange `schema_crc` in handshake; mismatch = hard fail
@@ -1633,6 +2072,10 @@ Reserved DSL keywords:
 - `requirements`, `ongoing`, `cancel` — query containers.
 - `costs`, `cooldowns`, `duration`, `period`, `every`, `attributes`, `effects`, `abilities` — body blocks.
 - `prefab`, `ability`, `effect` — top-level decls.
+- `commands` — top-level command-tag list (§ 2.6).
+- `command` — optional documentation prefix inside `commands { }`.
+- `input` — per-prefab input layout block (§ 2.6).
+- `button`, `stick` — input slot kinds.
 - `wait`, `wait_event`, `timeout`, `continue`, `break`, `emit`, `apply`, `remove`, `cancel`, `despawn`,
   `spawn`, `if`, `else`, `while`, `return` — statements.
 - `and`, `or`, `not` — boolean operators.
@@ -1732,7 +2175,7 @@ Game code includes only `ecs_script.h`. All runtime functions take
   counts are a pure function of source.
 - **Reserved gaps for hot-reload** — adding a tag shifts every later ID. For
   dev iteration we accept the rebuild cost (bytecode re-emitted, live world
-  remapped via `name_hash`). Reserved-gap padding is *not* part of the
+  remapped via tag-path lookup). Reserved-gap padding is *not* part of the
   language — keep determinism simple.
 - **Multi-target abilities** — `target` is a single entity in v1. Multi-target
   (cone, AOE) → loop with `for_each_in_radius(...)` builtin; each iteration

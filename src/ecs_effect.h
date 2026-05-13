@@ -39,7 +39,7 @@ typedef struct {
 } effect_cap_t;                 /* 8 bytes; 2 bytes trailing pad */
 
 static inline const effect_def_t* effect_get_def(const script_db_t* db, uint16_t effect_tag) {
-    uint32_t off = BLOB_ARR(&db->root->tag_defs, tag_def_t)[effect_tag].def_offset;
+    uint32_t off = tag_def_def_offset(&BLOB_ARR(&db->root->tag_defs, tag_def_t)[effect_tag]);
     return (const effect_def_t*)((const uint8_t*)db->root + off);
 }
 

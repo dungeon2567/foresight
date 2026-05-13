@@ -27,10 +27,11 @@ static inline ast_idx_t ast_child(const ast_arena_t* a, ast_idx_t n_idx, uint32_
     return a->child_runs[n->children[0] + i];
 }
 
-/* Tag-string entry: (hash, pointer-into-source, length).
-   Source string outlives the parser; safe to keep raw char* for compile-time use. */
+/* Tag-string entry: pointer into source + length. Interned by string equality;
+   index into this table is the parser-local tag handle stored in AST nodes
+   (u.tag.tag_idx / u.attr.tag_idx). Source string outlives the parser; safe
+   to keep raw char* for compile-time use. */
 typedef struct {
-    uint32_t    hash;
     const char* str;
     uint32_t    len;
 } tag_str_t;
@@ -40,10 +41,13 @@ typedef struct {
     ast_arena_t arena;
     const char* filename;
     int         had_error;
-    /* Interned tag paths (parallel for schema builder; unique by hash). */
+    /* Interned tag paths. Unique by (str,len) memcmp; AST nodes store index here.
+       256-bucket hash index (head + next chain) avoids O(N^2) dedup. */
     tag_str_t*  tag_strs;
     uint32_t    tag_strs_count;
     uint32_t    tag_strs_cap;
+    uint32_t*   tag_strs_next;       /* parallel chain: next[i] = idx+1, 0 = end */
+    uint32_t    tag_strs_head[256];  /* bucket head: idx+1, 0 = empty */
 } parser_t;
 
 void     parser_init   (parser_t* p, const char* src, uint32_t len, const char* filename);

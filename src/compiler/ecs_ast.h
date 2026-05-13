@@ -12,6 +12,10 @@ typedef enum {
     AST_DECL_PREFAB,
     AST_DECL_ABILITY,
     AST_DECL_EFFECT,
+    AST_DECL_COMMANDS,     /* commands { ... } — list of command tag names */
+    AST_DECL_INPUT,        /* input    { ... } — list of button/stick slots */
+    AST_INPUT_BUTTON,      /* `button name` entry inside input { } */
+    AST_INPUT_STICK,       /* `stick  name` entry inside input { } */
 
     AST_BLOCK_TAGS,
     AST_BLOCK_OWNED_TAGS,
@@ -100,8 +104,8 @@ typedef struct {
     uint8_t    flags;
     union {
         int32_t  lit;                              /* AST_EXPR_LIT */
-        struct { ast_subject_t subj; uint32_t tag_hash; } attr;  /* AST_EXPR_ATTR */
-        struct { uint32_t tag_hash; }  tag;        /* clause tag / on hook / decl name */
+        struct { ast_subject_t subj; uint32_t tag_idx; } attr;  /* AST_EXPR_ATTR — index into parser->tag_strs */
+        struct { uint32_t tag_idx; }   tag;        /* clause tag / on hook / decl name */
         struct { binop_t op; }         binop;
         struct { unop_t  op; }         unop;
         struct { builtin_t id; }       builtin;
