@@ -125,10 +125,23 @@ if (ECS_BUILD_TESTS)
         src/ecs_query.c
         src/ecs_broadphase.c
         src/ecs_input.c
+        # Scripting layer (runtime + VM + query evaluator).
+        src/ecs_script.c
+        src/ecs_script_query.c
+        src/ecs_vm.c
+        src/ecs_effect.c
+        src/ecs_formula.c
+        # Compile-time pipeline: source → AST → blob.
+        src/compiler/ecs_compiler.c
+        src/compiler/ecs_lexer.c
+        src/compiler/ecs_parser.c
+        src/compiler/ecs_schema.c
+        src/compiler/ecs_codegen.c
     )
 
     target_include_directories(ecs PRIVATE
         src
+        src/compiler
         tests
         ${zstd_SOURCE_DIR}/lib
     )
