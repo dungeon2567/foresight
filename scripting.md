@@ -126,7 +126,7 @@ inside an `all`. There is one gate per concern.
 | `effects`     | prefab            | List of effect tags applied at spawn                                  |
 | `abilities`   | prefab            | List of ability tags granted at spawn                                 |
 | `costs`       | ability           | `attr_tag = <formula>` pairs; checked + deducted on activation        |
-| `cooldown`    | ability           | `duration = <formula>` plus optional `tags { ... }`. Repeatable.      |
+| `cooldowns`   | ability           | `duration = <formula>` plus optional `tags { ... }`. Repeatable.      |
 | `duration`    | effect            | `<formula>` resolving to ticks (`5s`, `30t`, `infinite`, or expr)     |
 | `period`      | effect            | `<formula>` tick interval for `every`                                 |
 | `every`       | effect            | Body run each `period` while active                                   |
@@ -163,13 +163,13 @@ on damage         { if self.health <= 0 { despawn self } }
 
 ### 2.5 Cooldowns
 
-The `cooldown { }` block is a list of `<tag> = <duration_formula>` entries.
+The `cooldowns { }` block is a list of `<tag> = <duration_formula>` entries.
 Each entry declares one cooldown bucket: while active, the caster owns the
 tag for the duration. Multiple entries per ability — typical mix is
 self-cooldown, GCD, and school cooldown.
 
 ```
-cooldown {
+cooldowns {
   ability.fireball = 30s                          // self cooldown
   ability          = 1.5s - self.haste * 0.05s   // GCD bucket
   ability.fire     = 8s                           // school cooldown
@@ -288,7 +288,7 @@ ability fireball {
     stamina = 5
   }
 
-  cooldown {
+  cooldowns {
     ability.fireball = 30s                            // self cooldown
     ability          = 1.5s - self.haste * 0.05s      // GCD bucket
     ability.fire     = 8s                             // school cooldown
@@ -1498,7 +1498,7 @@ all queries/formulas: `{ self = caster, target = target }`.
    for each record, evaluate `cancel` query against record (subject = record's
    `tags ∪ owned_tags`). Cancel matching records.
 5. **Costs (deduct phase).** Atomically deduct: `caster.<attr> -= value`.
-6. **Cooldowns.** For each `cooldown { }` block on the ability, evaluate
+6. **Cooldowns.** For each `cooldowns { }` block on the ability, evaluate
    its `duration` formula and `apply` the synthetic cooldown effect to
    `caster`. Cooldowns start now and persist whether or not the body
    completes — body cancellation does NOT cancel cooldowns.
@@ -1631,7 +1631,7 @@ Reserved DSL keywords:
 - `all`, `any`, `none`, `exact` — query combinators / clause modifiers.
 - `tags`, `owned_tags` — owning tag containers.
 - `requirements`, `ongoing`, `cancel` — query containers.
-- `costs`, `cooldown`, `duration`, `period`, `every`, `attributes`, `effects`, `abilities` — body blocks.
+- `costs`, `cooldowns`, `duration`, `period`, `every`, `attributes`, `effects`, `abilities` — body blocks.
 - `prefab`, `ability`, `effect` — top-level decls.
 - `wait`, `wait_event`, `timeout`, `continue`, `break`, `emit`, `apply`, `remove`, `cancel`, `despawn`,
   `spawn`, `if`, `else`, `while`, `return` — statements.

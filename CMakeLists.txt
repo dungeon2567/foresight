@@ -146,6 +146,11 @@ if (ECS_BUILD_TESTS)
         ${zstd_SOURCE_DIR}/lib
     )
 
+    # Path to .script samples for test_script_compile.h.
+    target_compile_definitions(ecs PRIVATE
+        SCRIPTS_DIR="${CMAKE_SOURCE_DIR}/scripts"
+    )
+
     if (ECS_USE_MIMALLOC)
         target_link_libraries(ecs PRIVATE mimalloc-static libzstd_static)
     else()

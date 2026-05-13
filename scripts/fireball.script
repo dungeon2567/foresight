@@ -1,6 +1,7 @@
 // Fireball — sample ability with cost, cooldown, and follow-up effect.
-// Hierarchical cooldown buckets compose: while ability.fireball is active,
-// any query for `none { ability }` also matches (parent prolongs ancestor).
+// Cooldown buckets must be dotted (bare `ability` would collide with the
+// reserved keyword). Hierarchical match means `ability.fireball` still
+// blocks anything querying `none { ability }`.
 
 ability fireball {
     tags {
@@ -15,9 +16,8 @@ ability fireball {
         mana = 20
     }
 
-    cooldown {
+    cooldowns {
         ability.fireball = 10s
-        ability          = 1s
     }
 
     on activate {
@@ -32,14 +32,10 @@ ability fireball {
 effect burning {
     owned_tags { status.burning }
 
-    duration 5s
-    period   1s
+    duration { 5s }
+    period   { 1s }
 
     every {
         emit damage.fire(amount = 5)
-    }
-
-    on remove {
-        // hook fires when the effect is stripped early
     }
 }

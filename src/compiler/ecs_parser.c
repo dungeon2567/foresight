@@ -733,7 +733,7 @@ static ast_idx_t parse_body_block(parse_ctx_t* c) {
                 sub = n;
             } break;
             case TOK_KW_COSTS:    lexer_next(&c->p->lex); sub = parse_kv_block(c, AST_BLOCK_COSTS);     break;
-            case TOK_KW_COOLDOWN: lexer_next(&c->p->lex); sub = parse_kv_block(c, AST_BLOCK_COOLDOWN);  break;
+            case TOK_KW_COOLDOWNS: lexer_next(&c->p->lex); sub = parse_kv_block(c, AST_BLOCK_COOLDOWNS); break;
             case TOK_KW_DURATION: lexer_next(&c->p->lex); sub = parse_expr_block(c, AST_BLOCK_DURATION); break;
             case TOK_KW_PERIOD:   lexer_next(&c->p->lex); sub = parse_expr_block(c, AST_BLOCK_PERIOD);   break;
             case TOK_KW_EVERY:    lexer_next(&c->p->lex); {
@@ -818,9 +818,9 @@ void parser_init(parser_t* p, const char* src, uint32_t len, const char* filenam
 }
 
 void parser_destroy(parser_t* p) {
-    free(p->arena.nodes);       p->arena.nodes = NULL;
-    free(p->arena.child_runs);  p->arena.child_runs = NULL;
-    free(p->tag_strs);          p->tag_strs    = NULL;
+    ecs_free(p->arena.nodes);       p->arena.nodes = NULL;
+    ecs_free(p->arena.child_runs);  p->arena.child_runs = NULL;
+    ecs_free(p->tag_strs);          p->tag_strs    = NULL;
     p->arena.count = p->arena.cap = 0;
     p->arena.child_runs_count = p->arena.child_runs_cap = 0;
     p->tag_strs_count = p->tag_strs_cap = 0;
@@ -838,7 +838,7 @@ int parser_run(parser_t* p) {
     set_children(&p->arena, root, &c.kids_buf[saved], c.kids_count - saved);
     /* Store root index at slot 0 children[0] for retrieval. */
     p->arena.nodes[0].children[0] = root;
-    free(c.kids_buf);
+    ecs_free(c.kids_buf);
     return !p->had_error;
 }
 

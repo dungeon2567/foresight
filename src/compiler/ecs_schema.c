@@ -17,7 +17,7 @@ void tag_schema_init(tag_schema_t* s) {
 }
 
 void tag_schema_destroy(tag_schema_t* s) {
-    free(s->tags);
+    ecs_free(s->tags);
     memset(s, 0, sizeof(*s));
 }
 

@@ -16,7 +16,7 @@ static const struct { const char* kw; uint8_t len; token_kind_t kind; } keywords
     {"ongoing",      7,  TOK_KW_ONGOING},
     {"cancel",       6,  TOK_KW_CANCEL},
     {"costs",        5,  TOK_KW_COSTS},
-    {"cooldown",     8,  TOK_KW_COOLDOWN},
+    {"cooldowns",    9,  TOK_KW_COOLDOWNS},
     {"duration",     8,  TOK_KW_DURATION},
     {"period",       6,  TOK_KW_PERIOD},
     {"every",        5,  TOK_KW_EVERY},

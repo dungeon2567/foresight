@@ -426,9 +426,9 @@ static void cg_reset(cg_t* c) {
 }
 
 static void cg_free(cg_t* c) {
-    free(c->bc);            c->bc = NULL;
-    free(c->break_patches); c->break_patches = NULL;
-    free(c->cont_patches);  c->cont_patches  = NULL;
+    ecs_free(c->bc);            c->bc = NULL;
+    ecs_free(c->break_patches); c->break_patches = NULL;
+    ecs_free(c->cont_patches);  c->cont_patches  = NULL;
 }
 
 /* ==========================================================================
@@ -757,7 +757,7 @@ static void emit_ability_decl(cg_t* c, ast_idx_t decl) {
         }
     }
     /* cooldowns */
-    ast_idx_t cdb = find_block(c, body, AST_BLOCK_COOLDOWN);
+    ast_idx_t cdb = find_block(c, body, AST_BLOCK_COOLDOWNS);
     if (cdb) {
         uint32_t n = c->arena->nodes[cdb].n_children;
         cooldown_entry_t* arr = (cooldown_entry_t*)blob_alloc(c->w,
