@@ -4,10 +4,9 @@
 #include <ctype.h>
 
 static const struct { const char* kw; uint8_t len; token_kind_t kind; } keywords[] = {
-    {"entity",       6,  TOK_KW_ENTITY},
+    {"prefab",       6,  TOK_KW_PREFAB},
     {"ability",      7,  TOK_KW_ABILITY},
     {"effect",       6,  TOK_KW_EFFECT},
-    {"tag",          3,  TOK_KW_TAG},
     {"tags",         4,  TOK_KW_TAGS},
     {"owned_tags",  10,  TOK_KW_OWNED_TAGS},
     {"attributes",  10,  TOK_KW_ATTRIBUTES},

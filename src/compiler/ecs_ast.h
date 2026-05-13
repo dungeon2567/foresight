@@ -9,10 +9,9 @@
    ========================================================================== */
 
 typedef enum {
-    AST_DECL_ENTITY,
+    AST_DECL_PREFAB,
     AST_DECL_ABILITY,
     AST_DECL_EFFECT,
-    AST_DECL_TAG,
 
     AST_BLOCK_TAGS,
     AST_BLOCK_OWNED_TAGS,

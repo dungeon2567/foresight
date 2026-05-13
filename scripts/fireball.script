@@ -1,0 +1,45 @@
+// Fireball — sample ability with cost, cooldown, and follow-up effect.
+// Hierarchical cooldown buckets compose: while ability.fireball is active,
+// any query for `none { ability }` also matches (parent prolongs ancestor).
+
+ability fireball {
+    tags {
+        ability.fire
+    }
+
+    requirements {
+        all { self.mana >= 20 }
+    }
+
+    costs {
+        mana = 20
+    }
+
+    cooldown {
+        ability.fireball = 10s
+        ability          = 1s
+    }
+
+    on activate {
+        emit damage.fire(amount = 30)
+        apply burning
+    }
+}
+
+// Periodic damage-over-time, applied by fireball.
+// `every` fires once per `period` while ongoing holds. `duration` defines
+// expiry (in ticks via the `s` suffix → tick-rate scaled at codegen).
+effect burning {
+    owned_tags { status.burning }
+
+    duration 5s
+    period   1s
+
+    every {
+        emit damage.fire(amount = 5)
+    }
+
+    on remove {
+        // hook fires when the effect is stripped early
+    }
+}

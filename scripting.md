@@ -13,18 +13,22 @@ string lookup.
 
 ## 1. Top-level forms
 
-Four top-level decls. Every decl name becomes a tag in the global tag table.
-There is one flat global tag namespace; `entity player` and `ability fireball`
+Three top-level decls. Every decl name becomes a tag in the global tag table.
+There is one flat global tag namespace; `prefab player` and `ability fireball`
 register tags `player` and `fireball` directly.
 
 ```
-entity   player    { ... }   // prefab template (declares attribute values)
+prefab   player    { ... }   // entity template (declares attribute values)
 ability  fireball  { ... }   // async state machine, granted to entities
 effect   burning   { ... }   // duration / periodic / event-reactive modifier
-tag      spell.fire          // optional explicit declaration; usually implicit
 ```
 
 Decl name = tag path. Dotted names allowed: `ability spell.fire.fireball`.
+
+Plain tags (no def) need no decl — they are harvested automatically from
+every position where a tag literal appears (owning containers, query
+clauses, `emit`, `apply`, `on TAG` hooks). Listing a tag in `owned_tags`
+or referencing it in a query is enough to register it.
 
 **No `attribute` decl.** Attributes are not first-class. An attribute is just
 a `(tag, fixed_t value)` pair stored on an entity. Any tag mentioned in an
@@ -118,9 +122,9 @@ inside an `all`. There is one gate per concern.
 
 | Block         | Where             | Contents                                                              |
 |---------------|-------------------|-----------------------------------------------------------------------|
-| `attributes`  | entity            | `tag = <formula>` pairs — one fixed_t value per attribute tag         |
-| `effects`     | entity            | List of effect tags applied at spawn                                  |
-| `abilities`   | entity            | List of ability tags granted at spawn                                 |
+| `attributes`  | prefab            | `tag = <formula>` pairs — one fixed_t value per attribute tag         |
+| `effects`     | prefab            | List of effect tags applied at spawn                                  |
+| `abilities`   | prefab            | List of ability tags granted at spawn                                 |
 | `costs`       | ability           | `attr_tag = <formula>` pairs; checked + deducted on activation        |
 | `cooldown`    | ability           | `duration = <formula>` plus optional `tags { ... }`. Repeatable.      |
 | `duration`    | effect            | `<formula>` resolving to ticks (`5s`, `30t`, `infinite`, or expr)     |
@@ -141,8 +145,8 @@ Reserved keywords cannot be used as user tag names (compiler error).
 |-------------------|----------|------------------------------------------------------|
 | `on activate`     | ability  | After costs paid + requirements satisfied            |
 | `on end`          | ability  | When ability ends (success, cancel, or interrupt)    |
-| `on init`         | entity   | At spawn, after attributes initialised               |
-| `on despawn`      | entity   | When entity is despawned                             |
+| `on init`         | prefab   | At spawn, after attributes initialised               |
+| `on despawn`      | prefab   | When entity is despawned                             |
 
 Reserved set: `activate`, `end`, `init`, `despawn`.
 
@@ -213,7 +217,7 @@ TAG)` — returns 0 if the exact tag is not currently on the entity, else
 ### 3.1 Entity (prefab)
 
 ```
-entity player {
+prefab player {
   tags { creature.humanoid }
 
   attributes {
@@ -562,13 +566,6 @@ ability trade {
 - `or` / `and` boolean operators.
 - `continue` inside `while`.
 
-### 3.7 Bare tag
-
-```
-tag spell.fire        // explicit, optional — usually picked up by use site
-tag damage.physical
-```
-
 ---
 
 ## 4. Tag harvest, sort, and ID assignment
@@ -577,7 +574,7 @@ tag damage.physical
 
 The compiler harvests tags from every position where a tag literal can appear:
 
-- Decl names: `entity X`, `ability X`, `effect X`, `tag X`.
+- Decl names: `prefab X`, `ability X`, `effect X`.
 - Owning tag containers: `tags`, `owned_tags`.
 - Query blocks (every tag-clause leaf is a tag literal):
   `requirements`, `ongoing`, `cancel`.
@@ -587,7 +584,7 @@ The compiler harvests tags from every position where a tag literal can appear:
 - `apply TAG -> ...`, `remove TAG`, `cancel TAG`
 - `has_tag(self, TAG)` and other tag-builtin args
 - Event payload field names: `event.amount` registers tag `amount`
-- `effects { ... }`, `abilities { ... }` lists inside entity decls
+- `effects { ... }`, `abilities { ... }` lists inside prefab decls
 
 ### 4.2 Implicit ancestor promotion
 
@@ -652,7 +649,7 @@ These are language rules that exist purely to keep tag harvest pure:
   `damage . fire`.
 - Decl names must match `[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*`.
 - Single global tag namespace. Two decls with the same name across kinds is a
-  compile-time error (so `entity health` and `effect health` cannot coexist).
+  compile-time error (so `prefab health` and `effect health` cannot coexist).
 - File enumeration is sorted by path before scan.
 - No anonymous decls.
 
@@ -791,10 +788,10 @@ fixed_t formula_eval(uint16_t formula_id, const ctx_t* ctx);
 
 #### Cycle detection (init time only)
 
-Entity `attributes { ... }` initializers can reference other attributes of
+Prefab `attributes { ... }` initializers can reference other attributes of
 the same entity. The compiler builds a per-prefab dependency graph and
 emits a topologically-sorted init order. Cycles in attribute initializers
-are a compile error: `entity player attribute health depends on mana, which
+are a compile error: `prefab player attribute health depends on mana, which
 depends on health`.
 
 Other formulas (cost, duration, damage, etc.) are evaluated *post-spawn* and
@@ -1355,14 +1352,14 @@ After parse, walk all decl ASTs and build flat def tables:
 
 All tables use integer offsets — no pointers.
 
-**Attribute initializer topo-sort.** For each entity decl, build a dependency
+**Attribute initializer topo-sort.** For each prefab decl, build a dependency
 graph among its `attributes { tag = formula }` entries (formula references
 earlier tags in the same block). Topological sort; cycle → compile error.
 
 ### 11.5 Pass 5 — Codegen
 
 Walk each script body (ability `on activate`, `on end`; effect `every`, `on TAG`;
-entity `on init`, `on despawn`) and emit bytecode into `script_pool[]`.
+prefab `on init`, `on despawn`) and emit bytecode into `script_pool[]`.
 
 **Expression codegen** (recursive, post-order → stack machine):
 - Literal → `LOAD_CONST`
@@ -1627,7 +1624,7 @@ Reserved subject names (cannot be tag names — compiler rejects):
 Reserved lifecycle hook names (used after `on `):
 
 - `activate`, `end`        (ability)
-- `init`, `despawn`        (entity)
+- `init`, `despawn`        (prefab)
 
 Reserved DSL keywords:
 
@@ -1635,7 +1632,7 @@ Reserved DSL keywords:
 - `tags`, `owned_tags` — owning tag containers.
 - `requirements`, `ongoing`, `cancel` — query containers.
 - `costs`, `cooldown`, `duration`, `period`, `every`, `attributes`, `effects`, `abilities` — body blocks.
-- `entity`, `ability`, `effect`, `tag` — top-level decls.
+- `prefab`, `ability`, `effect` — top-level decls.
 - `wait`, `wait_event`, `timeout`, `continue`, `break`, `emit`, `apply`, `remove`, `cancel`, `despawn`,
   `spawn`, `if`, `else`, `while`, `return` — statements.
 - `and`, `or`, `not` — boolean operators.

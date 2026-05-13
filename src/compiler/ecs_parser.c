@@ -156,10 +156,9 @@ static void kids_push(parse_ctx_t* c, ast_idx_t idx) {
    Forward decls.
    ========================================================================== */
 static ast_idx_t parse_decl     (parse_ctx_t* c);
-static ast_idx_t parse_entity   (parse_ctx_t* c, uint32_t name_hash);
+static ast_idx_t parse_prefab   (parse_ctx_t* c, uint32_t name_hash);
 static ast_idx_t parse_ability  (parse_ctx_t* c, uint32_t name_hash);
 static ast_idx_t parse_effect   (parse_ctx_t* c, uint32_t name_hash);
-static ast_idx_t parse_tag_decl (parse_ctx_t* c, uint32_t name_hash);
 static ast_idx_t parse_block_body(parse_ctx_t* c, token_kind_t end);
 static ast_idx_t parse_query    (parse_ctx_t* c);
 static ast_idx_t parse_query_section(parse_ctx_t* c, ast_kind_t kind);
@@ -764,9 +763,9 @@ static ast_idx_t parse_body_block(parse_ctx_t* c) {
 /* ==========================================================================
    Top-level declarations.
    ========================================================================== */
-static ast_idx_t parse_entity(parse_ctx_t* c, uint32_t name_hash) {
+static ast_idx_t parse_prefab(parse_ctx_t* c, uint32_t name_hash) {
     ast_idx_t body = parse_body_block(c);
-    ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_ENTITY);
+    ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_PREFAB);
     c->p->arena.nodes[n].u.tag.tag_hash = name_hash;
     ast_idx_t kk[1] = { body };
     set_children(&c->p->arena, n, kk, 1);
@@ -791,22 +790,10 @@ static ast_idx_t parse_effect(parse_ctx_t* c, uint32_t name_hash) {
     return n;
 }
 
-static ast_idx_t parse_tag_decl(parse_ctx_t* c, uint32_t name_hash) {
-    /* tag <path> ; or tag <path> {} (empty body for grouping). */
-    if (check(c->p, TOK_LBRACE)) {
-        lexer_next(&c->p->lex);
-        while (!check(c->p, TOK_RBRACE) && !check(c->p, TOK_EOF)) consume(c->p);
-        expect(c->p, TOK_RBRACE, "expected '}'");
-    }
-    ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_TAG);
-    c->p->arena.nodes[n].u.tag.tag_hash = name_hash;
-    return n;
-}
-
 static ast_idx_t parse_decl(parse_ctx_t* c) {
     token_kind_t k = peek(c->p).kind;
-    if (k != TOK_KW_ENTITY && k != TOK_KW_ABILITY && k != TOK_KW_EFFECT && k != TOK_KW_TAG) {
-        error(c->p, "expected 'entity', 'ability', 'effect', or 'tag'");
+    if (k != TOK_KW_PREFAB && k != TOK_KW_ABILITY && k != TOK_KW_EFFECT) {
+        error(c->p, "expected 'prefab', 'ability', or 'effect'");
         consume(c->p);
         return 0;
     }
@@ -814,10 +801,9 @@ static ast_idx_t parse_decl(parse_ctx_t* c) {
     token_t name = expect(c->p, TOK_IDENT, "expected declaration name");
     uint32_t h = intern_tag(c->p,name.start, name.len);
     switch (k) {
-        case TOK_KW_ENTITY:  return parse_entity (c, h);
+        case TOK_KW_PREFAB:  return parse_prefab (c, h);
         case TOK_KW_ABILITY: return parse_ability(c, h);
         case TOK_KW_EFFECT:  return parse_effect (c, h);
-        case TOK_KW_TAG:     return parse_tag_decl(c, h);
         default: return 0;
     }
 }

@@ -76,7 +76,7 @@ void tag_schema_classify_parser(tag_schema_t* s, const parser_t* p) {
         const ast_node_t* d = &p->arena.nodes[ci];
         uint8_t kind = TAG_KIND_TAG;
         switch ((ast_kind_t)d->kind) {
-            case AST_DECL_ENTITY:  kind = TAG_KIND_ENTITY;  break;
+            case AST_DECL_PREFAB:  kind = TAG_KIND_PREFAB;  break;
             case AST_DECL_ABILITY: kind = TAG_KIND_ABILITY; break;
             case AST_DECL_EFFECT:  kind = TAG_KIND_EFFECT;  break;
             default: continue;

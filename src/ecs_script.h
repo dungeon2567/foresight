@@ -32,7 +32,7 @@ typedef struct {
 
 typedef enum {
     TAG_KIND_TAG    = 0,
-    TAG_KIND_ENTITY = 1,
+    TAG_KIND_PREFAB = 1,
     TAG_KIND_ABILITY= 2,
     TAG_KIND_EFFECT = 3,
 } tag_kind_t;

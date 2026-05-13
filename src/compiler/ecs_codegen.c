@@ -900,7 +900,7 @@ void codegen_run(blob_writer_t* w, const ast_arena_t* arena, ast_idx_t root,
         switch ((ast_kind_t)arena->nodes[ci].kind) {
             case AST_DECL_ABILITY: emit_ability_decl(&c, ci); break;
             case AST_DECL_EFFECT:  emit_effect_decl (&c, ci); break;
-            case AST_DECL_ENTITY:  emit_prefab_decl (&c, ci); break;
+            case AST_DECL_PREFAB:  emit_prefab_decl (&c, ci); break;
             default: break;
         }
     }

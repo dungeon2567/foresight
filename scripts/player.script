@@ -1,0 +1,31 @@
+// Player prefab.
+// Attributes are flat (tag, fixed_t value) pairs — no schema, no defaults
+// beyond what's listed here. Hooks on the spawned entity run when matching
+// events arrive (hierarchical match: `on damage` catches damage.fire,
+// .frost, ...).
+
+prefab player {
+    tags {
+        unit.player
+    }
+
+    attributes {
+        health     = 100
+        health.max = 100
+        mana       = 50
+        mana.max   = 50
+        haste      = 0
+    }
+
+    on init {
+        self.health = self.health.max
+        self.mana   = self.mana.max
+    }
+
+    on damage {
+        self.health -= event.amount
+        if (self.health <= 0) {
+            despawn
+        }
+    }
+}

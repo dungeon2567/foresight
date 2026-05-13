@@ -12,6 +12,7 @@
 #include "test_broadphase.h"
 #include "test_input.h"
 #include "test_entity.h"
+#include "test_script_vm.h"
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>
@@ -171,6 +172,7 @@ int main(void) {
                | test_broadphase_all()
                | test_input_all()
                | test_entity_all()
+               | test_script_vm_all()
                | (failures ? 1 : 0);
 
     return result;
