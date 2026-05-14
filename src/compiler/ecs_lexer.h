@@ -44,7 +44,9 @@ typedef enum {
 
     /* Keywords */
     TOK_KW_PREFAB, TOK_KW_ABILITY, TOK_KW_EFFECT,
-    TOK_KW_COMMANDS, TOK_KW_COMMAND,
+    TOK_KW_COMMAND,
+    TOK_KW_TYPE_ENTITY,   /* `entity` param type inside command { } */
+    TOK_KW_TYPE_POINT,    /* `point`  param type — 2 fixed_t coords */
     TOK_KW_INPUT, TOK_KW_BUTTON, TOK_KW_STICK,
     TOK_KW_TAGS, TOK_KW_OWNED_TAGS, TOK_KW_ATTRIBUTES,
     TOK_KW_EFFECTS, TOK_KW_ABILITIES,

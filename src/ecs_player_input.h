@@ -3,18 +3,16 @@
 /* ==========================================================================
    Player input — generic reference implementation.
 
-   Wire layout (per player, bit-exact, no padding):
-     [ down: N bits | sticks: 32*M bits ]
-   Wire bit length = N + 32*M.
-
-   Memory layout (one byte-aligned record per player):
+   Wire == memory. Same bit layout both sides:
      [ down: N bits | was_down: N bits | sticks: 32*M bits ]
-   Memory stride   = ceil((2*N + 32*M) / 8).
+   Wire bit length = 2*N + 32*M.
+   Memory stride   = ceil((2*N + 32*M) / 8) bytes.
 
-   was_down is engine-local — never crosses the network. At tick-begin the
-   engine rolls down → was_down (player_input_tick_roll), then deserializes
-   the new wire frame which overwrites the down section. pressed / released
-   are pure functions of the two memory bits.
+   Both `down` and `was_down` cross the network. Sender computes the
+   next frame's `was_down` via player_input_tick_roll BEFORE serializing
+   (down → was_down copy), then writes the new frame's down + sticks.
+   Receiver applies the bytes verbatim — no local tick-roll. pressed /
+   released are pure functions of the two memory bits.
 
    Stick fields are signed Q1.15 (x then y, both 16 bits). Range
    [-1.0, +0.99997]. Q1.15 → Q16.16 is a left-shift by 1 (sign-extending).
@@ -39,9 +37,10 @@ static inline uint32_t player_input_stride(uint32_t n_buttons, uint32_t n_sticks
     return (2u * n_buttons + 32u * n_sticks + 7u) / 8u;
 }
 
-/* Wire bit length (no was_down) for a layout of N buttons and M sticks. */
+/* Wire bit length for a layout of N buttons and M sticks. Wire matches
+   memory layout (both `down` and `was_down` sent). */
 static inline uint32_t player_input_wire_bits(uint32_t n_buttons, uint32_t n_sticks) {
-    return n_buttons + 32u * n_sticks;
+    return 2u * n_buttons + 32u * n_sticks;
 }
 
 /* ==========================================================================
@@ -113,21 +112,22 @@ static inline void player_input_tick_roll(uint8_t* rec, uint32_t N, uint32_t M) 
 }
 
 /* ==========================================================================
-   Wire I/O.
+   Wire I/O. Wire = memory.
 
-   _read: consume N + 32*M bits from the deserializer, overwriting only the
-   down section + sticks. The was_down section is preserved (it should have
-   been seeded by the prior tick_roll call against THIS record).
+   _read:  consume 2*N + 32*M bits — writes the entire record (down +
+           was_down + sticks) from the wire. No local tick-roll needed.
 
-   _write: emit N down bits + 32*M stick bits to the serializer. was_down
-   is never transmitted.
+   _write: emit 2*N + 32*M bits — full record verbatim. Caller is
+           responsible for having rolled down → was_down BEFORE calling.
    ========================================================================== */
 static inline void player_input_read(uint8_t* rec, uint32_t N, uint32_t M,
                                       ecs_deserializer_t* d) {
-    for (uint32_t i = 0; i < N; i++) {
+    /* down + was_down sections (2*N bits, slot order). */
+    for (uint32_t i = 0; i < 2u * N; i++) {
         uint32_t b = (uint32_t)ecs_deserializer_read_bits(d, 1);
         pi_bit_set(rec, i, b);
     }
+    /* sticks. */
     for (uint32_t i = 0; i < M; i++) {
         uint32_t x = (uint32_t)ecs_deserializer_read_bits(d, 16);
         uint32_t y = (uint32_t)ecs_deserializer_read_bits(d, 16);
@@ -138,9 +138,11 @@ static inline void player_input_read(uint8_t* rec, uint32_t N, uint32_t M,
 
 static inline void player_input_write(const uint8_t* rec, uint32_t N, uint32_t M,
                                        ecs_serializer_t* w) {
-    for (uint32_t i = 0; i < N; i++) {
-        ecs_serializer_write_bits(w, pi_btn_down(rec, i), 1);
+    /* down + was_down sections (2*N bits). */
+    for (uint32_t i = 0; i < 2u * N; i++) {
+        ecs_serializer_write_bits(w, pi_bit_get(rec, i), 1);
     }
+    /* sticks. */
     for (uint32_t i = 0; i < M; i++) {
         uint32_t x = pi_bits_get(rec, 2u * N + 32u * i,        16u);
         uint32_t y = pi_bits_get(rec, 2u * N + 32u * i + 16u,  16u);

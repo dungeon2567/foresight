@@ -138,6 +138,24 @@ static token_t expect(parser_t* p, token_kind_t k, const char* what) {
     return t;
 }
 
+/* Accept TOK_IDENT or any reserved keyword as a name token — uses the
+   token's source bytes (start, len) regardless of kind. Lets things like
+   `target` / `source` / `self` / `position` be used as user-defined
+   field / slot names even though the lexer classifies them as keywords. */
+static token_t expect_name(parser_t* p, const char* what) {
+    token_t t = peek(p);
+    /* Reject anything that isn't an alphabetic identifier-or-keyword. */
+    int is_name =
+        (t.kind == TOK_IDENT) ||
+        (t.kind >= TOK_KW_PREFAB && t.kind < TOK_EOF);
+    if (!is_name) {
+        error(p, what);
+        return t;
+    }
+    lexer_next(&p->lex);
+    return t;
+}
+
 /* ==========================================================================
    Kids buffer — reusable to avoid alloc per node.
    ========================================================================== */
@@ -250,7 +268,7 @@ static ast_idx_t parse_primary(parse_ctx_t* c) {
         lexer_next(&c->p->lex);
         expect(c->p, TOK_DOT, "expected '.' after 'event'");
         uint32_t h = 0;
-        token_t name = expect(c->p, TOK_IDENT, "expected payload field");
+        token_t name = expect_name(c->p, "expected payload field");
         h = intern_tag(c->p,name.start, name.len);
         ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_PAYLOAD);
         c->p->arena.nodes[n].u.tag.tag_idx = h;
@@ -270,7 +288,7 @@ static ast_idx_t parse_primary(parse_ctx_t* c) {
     if (t.kind == TOK_KW_SELF || t.kind == TOK_KW_TARGET || t.kind == TOK_KW_SOURCE) {
         int subj = parse_subject_kw(c->p);
         expect(c->p, TOK_DOT, "expected '.' after subject");
-        token_t name = expect(c->p, TOK_IDENT, "expected attr path");
+        token_t name = expect_name(c->p, "expected attr path");
         ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_ATTR);
         c->p->arena.nodes[n].u.attr.subj     = (ast_subject_t)subj;
         c->p->arena.nodes[n].u.attr.tag_idx = intern_tag(c->p,name.start, name.len);
@@ -463,7 +481,7 @@ static ast_idx_t parse_stmt(parse_ctx_t* c) {
                 uint32_t saved = c->kids_count;
                 if (!check(c->p, TOK_RPAREN)) {
                     do {
-                        token_t name = expect(c->p, TOK_IDENT, "expected payload field");
+                        token_t name = expect_name(c->p, "expected payload field");
                         expect(c->p, TOK_ASSIGN, "expected '='");
                         ast_idx_t v = parse_expr(c);
                         ast_idx_t fk = arena_alloc(&c->p->arena, AST_EXPR_ASSIGN);
@@ -649,7 +667,7 @@ static ast_idx_t parse_kv_block(parse_ctx_t* c, ast_kind_t kind) {
     expect(c->p, TOK_LBRACE, "expected '{'");
     uint32_t saved = c->kids_count;
     while (!check(c->p, TOK_RBRACE) && !check(c->p, TOK_EOF)) {
-        token_t name = expect(c->p, TOK_IDENT, "expected key");
+        token_t name = expect_name(c->p, "expected key");
         expect(c->p, TOK_ASSIGN, "expected '='");
         ast_idx_t v  = parse_expr(c);
         ast_idx_t kv = arena_alloc(&c->p->arena, AST_EXPR_ASSIGN);
@@ -683,7 +701,7 @@ static ast_idx_t parse_expr_block(parse_ctx_t* c, ast_kind_t kind) {
 static ast_idx_t parse_on_hook(parse_ctx_t* c) {
     expect(c->p, TOK_KW_ON, "expected 'on'");
     uint32_t h = 0;
-    token_t t = expect(c->p, TOK_IDENT, "expected event tag");
+    token_t t = expect_name(c->p, "expected event tag");
     h = intern_tag(c->p,t.start, t.len);
     ast_idx_t body = parse_block_stmts(c);
     ast_idx_t n = arena_alloc(&c->p->arena, AST_ON_HOOK);
@@ -789,24 +807,41 @@ static ast_idx_t parse_effect(parse_ctx_t* c, uint32_t name_idx) {
     return n;
 }
 
-/* commands { [command] tag.path , ... } — anonymous top-level decl.
-   Optional `command` keyword before each entry is accepted as documentation
-   and stripped here. Each entry interned as a normal tag. */
-static ast_idx_t parse_commands(parse_ctx_t* c) {
-    lexer_next(&c->p->lex);                      /* consume `commands` */
+/* command NAME { type1 name1; type2 name2; ... }
+   Top-level decl. NAME becomes a tag with kind = TAG_KIND_COMMAND.
+   Each param is an AST_COMMAND_PARAM child with `flags` = param_type_t
+   and `u.tag.tag_idx` = interned param-name index. Empty body allowed. */
+static ast_idx_t parse_command_decl(parse_ctx_t* c) {
+    lexer_next(&c->p->lex);                                  /* consume `command` */
+    token_t name = expect_name(c->p, "expected command name");
+    uint32_t name_idx = intern_tag(c->p, name.start, name.len);
     expect(c->p, TOK_LBRACE, "expected '{'");
     uint32_t saved = c->kids_count;
     while (!check(c->p, TOK_RBRACE) && !check(c->p, TOK_EOF)) {
-        /* Optional `command` prefix. */
-        if (check(c->p, TOK_KW_COMMAND)) lexer_next(&c->p->lex);
-        uint32_t h = 0;
-        ast_idx_t tn = parse_tag_path(c, &h);
-        kids_push(c, tn);
-        match(c->p, TOK_COMMA);
+        token_kind_t tk = peek(c->p).kind;
+        uint8_t pt;
+        if      (tk == TOK_KW_TYPE_ENTITY) pt = (uint8_t)PARAM_TYPE_ENTITY;
+        else if (tk == TOK_KW_TYPE_POINT)  pt = (uint8_t)PARAM_TYPE_POINT;
+        else {
+            error(c->p, "expected param type ('entity' or 'point')");
+            consume(c->p);
+            continue;
+        }
+        lexer_next(&c->p->lex);
+        /* Field name: any ident or reserved-keyword text — `target`,
+           `source`, `position`, etc. all accepted. */
+        token_t pn = expect_name(c->p, "expected param name");
+        uint32_t pidx = intern_tag(c->p, pn.start, pn.len);
         match(c->p, TOK_SEMICOLON);
+        match(c->p, TOK_COMMA);
+        ast_idx_t pnode = arena_alloc(&c->p->arena, AST_COMMAND_PARAM);
+        c->p->arena.nodes[pnode].flags         = pt;
+        c->p->arena.nodes[pnode].u.tag.tag_idx = pidx;
+        kids_push(c, pnode);
     }
     expect(c->p, TOK_RBRACE, "expected '}'");
-    ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_COMMANDS);
+    ast_idx_t n = arena_alloc(&c->p->arena, AST_DECL_COMMAND);
+    c->p->arena.nodes[n].u.tag.tag_idx = name_idx;
     set_children(&c->p->arena, n, &c->kids_buf[saved], c->kids_count - saved);
     c->kids_count = saved;
     return n;
@@ -830,7 +865,7 @@ static ast_idx_t parse_input(parse_ctx_t* c) {
             continue;
         }
         lexer_next(&c->p->lex);
-        token_t name = expect(c->p, TOK_IDENT, "expected slot name");
+        token_t name = expect_name(c->p, "expected slot name");
         uint32_t h = intern_tag(c->p, name.start, name.len);
         ast_idx_t entry = arena_alloc(&c->p->arena, ak);
         c->p->arena.nodes[entry].u.tag.tag_idx = h;
@@ -847,16 +882,18 @@ static ast_idx_t parse_input(parse_ctx_t* c) {
 
 static ast_idx_t parse_decl(parse_ctx_t* c) {
     token_kind_t k = peek(c->p).kind;
-    /* Anonymous top-level decls (no name token). */
-    if (k == TOK_KW_COMMANDS) return parse_commands(c);
-    if (k == TOK_KW_INPUT)    return parse_input(c);
+    /* Top-level decls with body but no decl-name token (anonymous singletons). */
+    if (k == TOK_KW_INPUT)   return parse_input(c);
+    /* `command NAME { ... }` — has a name but is parsed separately so we can
+       enforce typed param parsing in the body. */
+    if (k == TOK_KW_COMMAND) return parse_command_decl(c);
     if (k != TOK_KW_PREFAB && k != TOK_KW_ABILITY && k != TOK_KW_EFFECT) {
-        error(c->p, "expected 'prefab', 'ability', 'effect', 'commands', or 'input'");
+        error(c->p, "expected 'prefab', 'ability', 'effect', 'command', or 'input'");
         consume(c->p);
         return 0;
     }
     lexer_next(&c->p->lex);
-    token_t name = expect(c->p, TOK_IDENT, "expected declaration name");
+    token_t name = expect_name(c->p, "expected declaration name");
     uint32_t h = intern_tag(c->p,name.start, name.len);
     switch (k) {
         case TOK_KW_PREFAB:  return parse_prefab (c, h);

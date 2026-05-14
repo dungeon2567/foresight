@@ -12,8 +12,9 @@ typedef enum {
     AST_DECL_PREFAB,
     AST_DECL_ABILITY,
     AST_DECL_EFFECT,
-    AST_DECL_COMMANDS,     /* commands { ... } — list of command tag names */
-    AST_DECL_INPUT,        /* input    { ... } — list of button/stick slots */
+    AST_DECL_COMMAND,      /* command NAME { type1 field1; type2 field2; ... } */
+    AST_COMMAND_PARAM,     /* `type name;` entry inside command { } — flags = param_type_t */
+    AST_DECL_INPUT,        /* input { ... } — list of button/stick slots */
     AST_INPUT_BUTTON,      /* `button name` entry inside input { } */
     AST_INPUT_STICK,       /* `stick  name` entry inside input { } */
 
@@ -86,6 +87,13 @@ typedef enum {
     BUILTIN_RANDOM_RANGE, BUILTIN_COOLDOWN_REMAINING,
     BUILTIN_HAS_TAG, BUILTIN_MATCH,
 } builtin_t;
+
+/* Param types accepted inside a `command { }` body. Stored in
+   AST_COMMAND_PARAM node's `flags` byte. */
+typedef enum {
+    PARAM_TYPE_ENTITY = 0,   /* entity_t — 4 bytes on wire */
+    PARAM_TYPE_POINT  = 1,   /* 2 × fixed_t (x, y) — 8 bytes on wire */
+} param_type_t;
 
 /* Subject id stored on AST_EXPR_ATTR nodes. Numerically identical to
    subject_t in ecs_script_query.h (0=SELF, 1=TARGET, 2=SOURCE); kept as a

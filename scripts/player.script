@@ -1,12 +1,17 @@
-// Top-level: command tag namespace + per-game input layout.
-// Both are anonymous decls (no name); one of each per game.
+// Top-level: typed commands + per-game input layout.
+// Each `command` decl is a typed intent event: name plus a record of
+// `(type field;)*` params. Param types currently supported:
+//   entity   — entity_t (4 bytes, uint32 bitfield id:18 + version:12)
+//   point    — 2D world coords (2 × fixed_t = 8 bytes)
+// `input { }` is the anonymous per-game input layout.
 
-commands {
-    fire
-    jump
-    crouch
-    command ability.fireball
-    command ability.iceblast
+
+command cast_ability {
+    entity target_entity;
+}
+
+command cast_ability_ground {
+    point position;
 }
 
 input {

@@ -77,7 +77,7 @@ share the same grammar and evaluator; only the subject differs.
 
 | Block          | Where           | When evaluated                                  | Subject(s) in scope                       |
 |----------------|-----------------|-------------------------------------------------|-------------------------------------------|
-| `requirements` | ability, effect | once at activation (ability) / application (effect) | `self`, `target` (ability), `source` (effect) |
+| `requirements` | ability, effect | once at activation (ability) / application (effect) | `self`, `target_entity` (ability), `source_entity` (effect) |
 | `ongoing`      | effect          | suspends/resumes effect while applied (record stays alive) | `self`, `source`                |
 | `cancel`       | ability         | once at activation, matched against *each* ability/effect record on `self` | the candidate record's `tags ∪ owned_tags` |
 
@@ -88,9 +88,9 @@ is cancelled.
 There is no separate `immunity` block. Protective effects use a convention:
 they declare protection tags via `owned_tags { immunity.<bucket> }`, and
 offensive abilities/effects gate themselves with
-`requirements { none { target.immunity.<bucket> } }`. Hierarchical matching
+`requirements { none { target_entity.immunity.<bucket> } }`. Hierarchical matching
 makes this composable: `owned_tags { immunity.fire }` blocks anything
-checking `target.immunity.fire`, `target.immunity.fire.minor`, etc.
+checking `target_entity.immunity.fire`, `target_entity.immunity.fire.minor`, etc.
 
 `ongoing` does **not** remove the effect record when false. It *disables* the effect:
 
@@ -130,8 +130,8 @@ inside an `all`. There is one gate per concern.
 | `duration`    | effect            | `<formula>` resolving to ticks (`5s`, `30t`, `infinite`, or expr)     |
 | `period`      | effect            | `<formula>` tick interval for `every`                                 |
 | `every`       | effect            | Body run each `period` while active                                   |
-| `source`      | effect            | `{ attr, ... }` — attrs to snapshot from source entity at application time; stored inline in the effect record; compiler resolves `source.X` for captured X to `LOAD_CAP_SRC` |
-| `target`      | effect            | `{ attr, ... }` — attrs to snapshot from target (`self`) entity at application time; stored inline in the effect record; compiler resolves `self.X` for captured X to `LOAD_CAP_TGT` |
+| `source_entity` | effect          | `{ attr, ... }` — attrs to snapshot from source entity at application time; stored inline in the effect record; compiler resolves `source_entity.X` for captured X to `LOAD_CAP_SRC` |
+| `target_entity` | effect          | `{ attr, ... }` — attrs to snapshot from target (`self`) entity at application time; stored inline in the effect record; compiler resolves `self.X` for captured X to `LOAD_CAP_TGT` |
 | `on <name>`   | any decl          | Hook body. `<name>` is either a lifecycle keyword (§ 2.3) or a tag literal (§ 2.4). |
 
 Every numeric position above accepts a **formula** (§ 6.4) — not just a literal.
@@ -214,9 +214,10 @@ TAG)` — returns 0 if the exact tag is not currently on the entity, else
 
 Gameplay scripts read player intent through two related surfaces:
 
-- **`commands { }`** — top-level decl listing command tag names. Each entry
-  registers a tag in the global namespace; commands are routable events,
-  typically emitted by the input layer and consumed by `on <command>` hooks.
+- **`command NAME { type field; ... }`** — top-level decl. Each command is
+  a named, typed intent event: a tag (`NAME`) plus a record of typed
+  params. Emitted by the input layer / scripts, consumed by `on NAME`
+  hooks. Tag kind = `TAG_KIND_COMMAND`.
 - **`input { }`** — top-level (per-game) block declaring the input layout
   the engine writes once per connected player per tick (before scripts
   run). Holds buttons + 2D sticks bit-packed in a deterministic record.
@@ -224,33 +225,253 @@ Gameplay scripts read player intent through two related surfaces:
 #### commands
 
 ```
-commands {
-    fire
-    jump
-    move
-    ability.fireball
-    ability.iceblast
+command cast_ability {
+    entity target_entity;
+}
+command cast_ability_ground {
+    point position;
 }
 ```
 
-Each entry becomes a tag (subject to ancestor promotion: `ability.fireball`
-also promotes `ability`). Dotted paths follow the same hierarchical-match
-rules as any other tag — `on ability { ... }` catches every ability command.
+Buttons (`fire`, `jump`, etc.) are **input slots**, not commands — declare
+them inside `input { }` (next subsection). Commands are higher-level
+typed intents that scripts emit from input edges or other logic.
 
-Commands are *just tags* — the `commands { }` block is documentation +
-namespace anchor; no special wire format. The optional `command` keyword
-before an entry is accepted as a style hint and ignored by codegen:
+Each `command NAME { ... }` decl:
+
+- Registers `NAME` as a tag with `kind = TAG_KIND_COMMAND`. Dotted paths
+  allowed: `command ability.fireball { ... }` promotes ancestor `ability`.
+- Defines a typed param record. Param order is declaration order;
+  serialization layout is generated from this order.
+
+Param types currently supported:
+
+| Type     | Wire size | Notes                                           |
+|----------|----------:|-------------------------------------------------|
+| `entity` |   32 bits | `entity_t` (id:18 + version:12, uint32 bitfield) |
+| `point`  |   64 bits | 2 × Q16.16 fixed_t (x, y) — world coords         |
+
+Body is required (empty `{ }` for paramless commands). Commands are
+emitted with their typed payload from script code:
 
 ```
-commands {
-    command fire           // equivalent to bare `fire`
-    command ability.fireball
+emit cast_ability(target_entity = some_entity)
+emit cast_ability_ground(position = ...)
+```
+
+Handlers receive the typed record:
+
+```
+on cast_ability {
+    if has_tag(event.target_entity, immunity) { return }
+    apply burning -> event.target_entity
 }
 ```
 
-Commands map to input slots (next section) or are emitted directly by
-script code (`emit ability.fireball`). Either way they flow through the
-normal event dispatch path (§ 13.3 step 5).
+Hierarchical match still applies — `on ability { ... }` catches every
+descendant command tag (`ability.fireball`, `ability.iceblast`, etc.).
+
+##### Command wire format
+
+Script commands ride the existing `ecs_input.h` command-stream channel
+without touching its protocol. The trick: the scripting layer reserves
+**one** of `ecs_input`'s 255 type-id slots for "scripting command", and
+discriminates between individual script commands using its own bit-tight
+sub-type id **packed inside the payload**.
+
+Why: `ecs_input.h`'s outer `type_id` is fixed at 8 bits. That width is
+hardcoded into the input wire and we don't edit `ecs_input.h` /
+`ecs_input.c`. But the script's discriminator can be tighter — a game
+with 2 script commands needs 1 bit, with 12 commands needs 4 bits, etc.
+Treating it as just leading payload bytes keeps the script command id
+**part of the payload data**, not part of the input wire framing.
+
+###### Wire (per emitted script command)
+
+What `ecs_input` writes on the wire for one script command — at its
+layer:
+
+```
+[ outer_type_id : 8 bits ][ outer_payload : registry[script_slot] bits ]
+```
+
+What the scripting-emitted `outer_payload` actually contains:
+
+```
+[ script_cmd_id : K bits ][ script_params : variable bits ][ pad : 0..7 ]
+```
+
+- `K = ceil(log2(C))` where `C` = number of `command` decls in the game.
+  C ≤ 2     → K = 1
+  C ≤ 4     → K = 2
+  C ≤ 16    → K = 4
+  C ≤ 256   → K = 8
+- `script_cmd_id`: this game's own command id, assigned by codegen from
+  declaration order (0..C-1).
+- `script_params`: params concatenated in declaration order, no padding
+  between fields:
+
+| Param type | Wire bits | Encoding                                       |
+|------------|----------:|------------------------------------------------|
+| `entity`   |        32 | `entity_t` (uint32 bitfield id:18 + version:12) |
+| `point`    |        64 | x:32 Q16.16 + y:32 Q16.16                      |
+
+###### Fitting the input registry
+
+`ecs_input` registry stores **one fixed `bit_len` per outer type_id**.
+The script picks one outer type_id and registers it with the **maximum**
+total bit count across all script commands:
+
+```
+script_slot_bits = K + max(params_bits for each script command)
+```
+
+Codegen pads shorter commands' payload with `pad` bits up to
+`script_slot_bits` so every emission lands on the registered size. Wasted
+bits per emission ≤ `params_bits(max) − params_bits(this)` — small for
+homogeneous command sets, larger when sizes differ wildly. Use it as a
+hint to keep param shapes uniform.
+
+###### Sample game (2 commands)
+
+```
+C = 2  →  K = 1
+cast_ability         : 32 bits params
+cast_ability_ground  : 64 bits params
+script_slot_bits     = 1 + max(32, 64) = 65
+```
+
+Per-emission cost (excluding `ecs_input`'s outer 8-bit type_id + 1-bit
+chain bookkeeping):
+
+| Command                                  | K | Params | pad | Total |
+|------------------------------------------|--:|-------:|----:|------:|
+| `cast_ability { entity target_entity; }` | 1 | 32 bits | 32 bits | **65 bits** |
+| `cast_ability_ground { point position; }`| 1 | 64 bits |  0 bits | **65 bits** |
+
+Tighter than fixed 8-bit type_id when C is small — at C ≤ 2, K=1 saves 7
+bits per emission vs treating each command as its own outer type_id.
+
+###### Type id assignment
+
+`script_cmd_id` is deterministic from the schema: codegen filters
+post-finalize tag table for `kind == TAG_KIND_COMMAND` and assigns
+sequential ids in tag-id order. Both peers compute the same mapping
+from identical source. The single outer `ecs_input` type_id used for
+script commands is also fixed (e.g. `CMD_TYPE_SCRIPT = 1`); codegen
+picks it and emits the registration call.
+
+###### Codegen-emitted helpers
+
+```c
+/* Per-command typed record. */
+typedef struct { entity_t target_entity; } cmd_cast_ability_t;
+typedef struct { fixed_t x, y; }           cmd_cast_ability_ground_t;
+
+/* Script command sub-type ids — deterministic, K bits wide. */
+#define SCRIPT_CMD_CAST_ABILITY         0
+#define SCRIPT_CMD_CAST_ABILITY_GROUND  1
+#define SCRIPT_CMD_ID_BITS              1   /* K = ceil(log2(C)) */
+#define SCRIPT_CMD_COUNT                2
+
+/* Per-command payload bits (params only, no K). */
+#define CMD_PARAM_BITS_CAST_ABILITY         32
+#define CMD_PARAM_BITS_CAST_ABILITY_GROUND  64
+
+/* Single outer ecs_input slot the script reserves for all commands. */
+#define SCRIPT_OUTER_TYPE_ID  1
+#define SCRIPT_OUTER_BIT_LEN  (SCRIPT_CMD_ID_BITS + 64)  /* K + max param bits */
+
+/* Boot-time registration — uses existing ecs_input API verbatim. */
+static inline void script_cmd_register(ecs_input_t* it) {
+    ecs_input_register_command_type(it, SCRIPT_OUTER_TYPE_ID, SCRIPT_OUTER_BIT_LEN);
+}
+
+/* Pack: writes K-bit sub-id + params + pad into out_bytes
+   (ceil(SCRIPT_OUTER_BIT_LEN/8) bytes). Callable from script_emit_*. */
+void script_cmd_pack_cast_ability       (uint8_t* out_bytes, const cmd_cast_ability_t* in);
+void script_cmd_pack_cast_ability_ground(uint8_t* out_bytes, const cmd_cast_ability_ground_t* in);
+
+/* Generic dispatcher — reads K-bit sub-id, unpacks into typed record,
+   invokes the right user handler. */
+typedef enum {
+    SCRIPT_CMD_OK = 0,
+    SCRIPT_CMD_UNKNOWN_ID = 1,
+} script_cmd_status_t;
+
+script_cmd_status_t script_cmd_dispatch(const uint8_t* in_bytes,
+                                        void* out_blob,
+                                        uint32_t* out_sub_id);
+```
+
+Pseudo-impl of pack (generated):
+
+```c
+void script_cmd_pack_cast_ability(uint8_t* out_bytes, const cmd_cast_ability_t* in) {
+    ecs_serializer_t s;
+    ecs_serializer_init(&s, out_bytes, (SCRIPT_OUTER_BIT_LEN + 63) / 64 * 8);
+    ecs_serializer_write_bits(&s, SCRIPT_CMD_CAST_ABILITY, SCRIPT_CMD_ID_BITS);
+    ecs_serializer_write_bits(&s, in->target_entity, 32);
+    /* pad up to SCRIPT_OUTER_BIT_LEN with zero bits. */
+    int32_t bits_written = ecs_serializer_get_bits_written(&s);
+    int32_t pad = SCRIPT_OUTER_BIT_LEN - bits_written;
+    if (pad > 0) ecs_serializer_write_bits(&s, 0, pad);
+    ecs_serializer_flush_bits(&s);
+}
+```
+
+Emit path:
+
+```c
+void script_emit_cast_ability(ecs_input_t* it, uint32_t tick, uint32_t slot,
+                              const cmd_cast_ability_t* args) {
+    uint8_t buf[(SCRIPT_OUTER_BIT_LEN + 7) / 8];
+    script_cmd_pack_cast_ability(buf, args);
+    ecs_input_cmd_append(it, tick, slot, SCRIPT_OUTER_TYPE_ID, buf);
+}
+```
+
+Apply path:
+
+```c
+void script_apply_commands(ecs_input_t* it, uint32_t tick, uint32_t slot) {
+    ecs_input_cmd_iter_t iter = ecs_input_cmd_iter_begin(it, tick, slot);
+    uint8_t      outer_type;
+    const void*  bytes;
+    uint32_t     bit_len;
+    while (ecs_input_cmd_iter_next(&iter, &outer_type, &bytes, &bit_len)) {
+        if (outer_type != SCRIPT_OUTER_TYPE_ID) continue;
+        uint32_t sub_id;
+        union {
+            cmd_cast_ability_t        cast;
+            cmd_cast_ability_ground_t cast_g;
+        } cmd;
+        if (script_cmd_dispatch(bytes, &cmd, &sub_id) != SCRIPT_CMD_OK) continue;
+        switch (sub_id) {
+            case SCRIPT_CMD_CAST_ABILITY:        /* run on_cast_ability(cmd.cast)        */; break;
+            case SCRIPT_CMD_CAST_ABILITY_GROUND: /* run on_cast_ability_ground(cmd.cast_g) */; break;
+        }
+    }
+}
+```
+
+###### Determinism
+
+`script_cmd_id` width K and value assignments are pure functions of the
+schema — both peers derive them identically. Pack / unpack are integer
+bit ops via `ecs_serializer.h`. Same bits → same typed record across
+architectures + rollback. Pad bits are always zero; receiver ignores
+them.
+
+###### Limits inherited
+
+- ≤ 4095 bits total per emitted script command (`ECS_INPUT_CMD_MAX_BITS`),
+  i.e. `K + max_params ≤ 4095`. K ≤ 12 in the worst case.
+- Per-tick per-slot command list is FIFO, append-only, authoritative-only
+  (no predicted/confirmed flag — script must only emit deterministic
+  commands).
+- Only one of `ecs_input`'s 255 outer type_id slots is consumed by the
+  scripting layer.
 
 #### input
 
@@ -291,13 +512,12 @@ prefab player {
 }
 ```
 
-##### `button` slots — 1 wire bit, 2 memory bits, 3 derived states
+##### `button` slots — 2 bits (wire + memory), 3 derived states
 
-Per button per tick:
-
-- **Wire**: `1` bit — only `down` (current frame).
-- **Memory**: `2` bits — `down` (current) + `was_down` (previous frame).
-  `was_down` is engine-local; never crosses the network.
+Per button per tick: **2 bits** — `down` (current) and `was_down`
+(previous). Identical layout on the wire and in memory. Sender
+rolls `down → was_down` before serializing each frame; receiver does
+no roll (both bits arrive explicitly).
 
 Three derived states cover all use cases:
 
@@ -399,15 +619,14 @@ and rollback. No floating point, no transcendental LUTs.
 
 Buttons + sticks share one opaque payload per player, slotted into the
 existing `ecs_input.h` table (one command type_id for the whole game's
-input layout). The payload is a **pure bitstream — only the `down` bit
-per button; no `was_down`, no padding between sections, no padding
-inside sticks**:
+input layout). The payload is a **pure bitstream — identical to the
+in-memory record, no padding between sections, no padding inside sticks**:
 
 ```
-bit 0      N                                                 N + 32M
- |          |                                                       |
- v          v                                                       v
- [ down N  ][ x0:16 | y0:16 | x1:16 | y1:16 | ... | xM-1:16 | yM-1:16 ]
+bit 0      N         2N                                        2N + 32M
+ |          |          |                                              |
+ v          v          v                                              v
+ [ down N ][ was_dn N ][ x0:16 | y0:16 | x1:16 | y1:16 | ... | yM-1:16 ]
 ```
 
 - `N` = button count
@@ -417,10 +636,10 @@ bit 0      N                                                 N + 32M
   declaration order, no padding.
 - Slot index within each section = declaration order
 
-**Exact wire bit length**: `bit_len = N + 32*M`. Registered with
+**Exact wire bit length**: `bit_len = 2*N + 32*M`. Registered with
 `ecs_input_register_cmd_type(registry, type_id, bit_len)` so the decoder
-knows the size without a per-command header. `was_down` is reconstructed
-locally each tick from last frame's `down`; never transmitted.
+knows the size without a per-command header. Both `down` and `was_down`
+are transmitted — receiver applies them verbatim, no local roll.
 
 **Record layout in the input BUFFER tree** — `ceil((2*N + 32*M) / 8)`
 bytes per player (memory holds both `down` and `was_down`). Bit offsets:
@@ -432,20 +651,20 @@ bytes per player (memory holds both `down` and `was_down`). Bit offsets:
 | `stick[i].x`          | `2*N + 32*i`          | 16 (signed Q1.15) |
 | `stick[i].y`          | `2*N + 32*i + 16`     | 16 (signed Q1.15) |
 
-**Memory stride**: `ceil((2*N + 32*M) / 8)` bytes per player.
-**Wire bit_len**: `N + 32*M` (down + sticks only).
+**Memory stride** = **wire bit_len rounded up to bytes** = `ceil((2*N + 32*M) / 8)` bytes.
+**Wire bit_len** = `2*N + 32*M` (down + was_down + sticks).
 
 A few concrete sizes:
 
 | Layout                | wire bit_len | wire bytes (P=1, no framing) | memory stride |
 |-----------------------|-------------:|-----------------------------:|--------------:|
-| 1 button, 0 sticks    |            1 |                          1 B |           1 B |
-| 3 buttons, 0 sticks   |            3 |                          1 B |           1 B |
-| 4 buttons, 1 stick    |           36 |                          5 B |           5 B |
-| 8 buttons, 1 stick    |           40 |                          5 B |           6 B |
-| 8 buttons, 2 sticks   |           72 |                          9 B |          10 B |
-| 16 buttons, 2 sticks  |           80 |                         10 B |          12 B |
-| 1 button, 1 stick     |           33 |                          5 B |           5 B |
+| 1 button, 0 sticks    |            2 |                          1 B |           1 B |
+| 3 buttons, 0 sticks   |            6 |                          1 B |           1 B |
+| 4 buttons, 1 stick    |           40 |                          5 B |           5 B |
+| 8 buttons, 1 stick    |           48 |                          6 B |           6 B |
+| 8 buttons, 2 sticks   |           80 |                         10 B |          10 B |
+| 16 buttons, 2 sticks  |           96 |                         12 B |          12 B |
+| 1 button, 1 stick     |           34 |                          5 B |           5 B |
 
 `N == 0` → button sections omitted; `M == 0` → stick section omitted.
 An empty `input { }` block (no slots) produces no record at all.
@@ -564,44 +783,47 @@ Game picks `coord_bits` per axis and per dimension (2D = 2 × per axis,
 at 60 Hz for P players. Tick framing + UDP/IP overhead not counted
 (~28 B per datagram).
 
-All numbers are **wire** bits per player (only `down` for buttons, no
-`was_down`).
+All numbers are **wire** bits per player — wire layout matches memory
+(2 bits per button: down + was_down, 32 bits per stick).
 
 | Composition (per player)                | Wire bits | Bytes if standalone |
 |------------------------------------------|----------:|---------------------:|
-| 4 buttons                                |         4 |                 1 B |
-| 8 buttons                                |         8 |                 1 B |
-| 16 buttons                               |        16 |                 2 B |
+| 4 buttons                                |         8 |                 1 B |
+| 8 buttons                                |        16 |                 2 B |
+| 16 buttons                               |        32 |                 4 B |
 | 1 stick                                  |        32 |                 4 B |
 | 2 sticks                                 |        64 |                 8 B |
-| 8 buttons + 1 stick                      |        40 |                 5 B |
-| 8 buttons + 2 sticks                     |        72 |                 9 B |
-| 16 buttons + 2 sticks                    |        80 |                10 B |
-| 8 buttons + 2 sticks + 2D pos Q.14       |       100 |                13 B |
-| 8 buttons + 2 sticks + 3D pos Q.16       |       120 |                15 B |
-| 16 buttons + 2 sticks + 3D pos Q.20      |       140 |                18 B |
+| 8 buttons + 1 stick                      |        48 |                 6 B |
+| 8 buttons + 2 sticks                     |        80 |                10 B |
+| 16 buttons + 2 sticks                    |        96 |                12 B |
+| 8 buttons + 2 sticks + 2D pos Q.14       |       108 |                14 B |
+| 8 buttons + 2 sticks + 3D pos Q.16       |       128 |                16 B |
+| 16 buttons + 2 sticks + 3D pos Q.20      |       156 |                20 B |
 
 **Multi-player packets** — packet bytes for P players + 16-bit tick_id
-(rounded up at the end, packing is bit-contiguous):
+(bit-contiguous, rounded up to bytes once at end):
 
 All players inside one packet are bit-contiguous (`(16 + P * bit_len)`
-bits total, rounded up to bytes once). bit_len per row:
-- 8 btn + 1 stick: 40 bits
-- 16 btn + 2 sticks: 80 bits
-- 16 btn + 2 sticks + 3D pos Q.16: 128 bits
+bits total). bit_len per row:
+- 8 btn + 1 stick: 48 bits
+- 16 btn + 2 sticks: 96 bits
+- 16 btn + 2 sticks + 3D pos Q.16: 144 bits
 
 | Players | 8 btn + 1 stick | 16 btn + 2 stick | + 3D pos Q.16 |
 |--------:|----------------:|-----------------:|--------------:|
-| 1       |             7 B |             12 B |          18 B |
-| 2       |            12 B |             22 B |          34 B |
-| 4       |            22 B |             42 B |          66 B |
-| 8       |            42 B |             82 B |         130 B |
-| 16      |            82 B |            162 B |         258 B |
+| 1       |             8 B |             14 B |          20 B |
+| 2       |            14 B |             26 B |          38 B |
+| 4       |            26 B |             50 B |          74 B |
+| 8       |            50 B |             98 B |         146 B |
+| 16      |            98 B |            194 B |         290 B |
 
-At 60 Hz, 16 players × (16 buttons + 2 sticks + 3D pos Q.16): `258 × 60
-≈ 15.5 KB/s = 124 kbit/s`. Halved with delta-from-last-acked
-(≈ 62 kbit/s). Within a single UDP datagram (MTU ~1500 B) → no
-fragmentation through ~92 players.
+At 60 Hz, 16 players × (16 buttons + 2 sticks + 3D pos Q.16): `290 × 60
+≈ 17.4 KB/s = 139 kbit/s`. Within a single UDP datagram (MTU ~1500 B) →
+no fragmentation through ~82 players. No per-receiver ack channel
+exists in `ecs_input.h`, so no further delta-encoding gains —
+every packet is self-contained within its R+1 cascade window. The
+chained-delta cascade IS the redundancy mechanism (each cascade tick
+diffed against the previous in the same packet).
 
 **Notes**:
 - No per-player ID in packet — derived from ordering or session handshake.
@@ -695,7 +917,7 @@ ability fireball {
     state.combat_ready                          // tag must hold
     self.intellect >= 10                         // predicate
     self.mana >= 30                              // predicate (also enforced by costs)
-    target.creature                              // target tag
+    target_entity.creature                              // target tag
     any {
       weapon.staff
       weapon.wand
@@ -705,8 +927,8 @@ ability fireball {
       status.silenced
       status.stunned
       status.dead
-      target.status.invulnerable
-      target.status.untargetable
+      target_entity.status.invulnerable
+      target_entity.status.untargetable
       // cooldown.* checks are injected automatically by the cooldown blocks below
     }
   }
@@ -736,7 +958,7 @@ ability fireball {
 
   on activate {
     wait 0.5s
-    target.emit damage.physical.fire {
+    target_entity.emit damage.physical.fire {
       amount = (self.spell_power * 1.5 + 20) * (1 + self.level * 0.05)
     }
     apply burning -> target
@@ -769,15 +991,15 @@ effect burning {
   }
 
   // Attrs snapshotted from source/target into the effect record at application time.
-  // source.spell_power inside this body reads the snapshot, not the live entity.
-  source { spell_power, level }
-  target { armor, health }
+  // source_entity.spell_power inside this body reads the snapshot, not the live entity.
+  source_entity { spell_power, level }
+  target_entity { armor, health }
 
-  duration = 5s + source.spell_power * 0.05s   // reads snapshot
+  duration = 5s + source_entity.spell_power * 0.05s   // reads snapshot
   period   = 1s
 
   every {
-    self.emit damage.fire { amount = 5 + source.spell_power * 0.25 }
+    self.emit damage.fire { amount = 5 + source_entity.spell_power * 0.25 }
   }
 
   on damage.fire {
@@ -801,18 +1023,18 @@ Offensive effects/abilities gate themselves on the matching bucket:
 
 ```
 effect burning {
-  requirements { none { target.immunity.status.burning } }
+  requirements { none { target_entity.immunity.status.burning } }
   // ...
 }
 
 ability fireball {
-  requirements { none { target.immunity.fire } }
+  requirements { none { target_entity.immunity.fire } }
   // ...
 }
 ```
 
 `owned_tags` is hierarchical: a single `immunity.fire` covers
-`target.immunity.fire`, `target.immunity.fire.minor`, etc. Add a new ward
+`target_entity.immunity.fire`, `target_entity.immunity.fire.minor`, etc. Add a new ward
 type by giving it the right `owned_tags`; offensive code does not change.
 
 ### 3.5 Effect — event-reactive damage modifier
@@ -842,7 +1064,7 @@ Notes:
   `(src.position - viewer.position)` is `< 0`).
 - Handlers fire in a defined order so multiple damage-modifying effects
   compose deterministically (sort by `(effect_tag preorder id, apply_tick,
-  source.id)` — no race).
+  source_entity.id)` — no race).
 - `event.amount` is mutable; the final value seen by the recipient's own
   `on damage` handler is whatever the chain of effect handlers leaves.
 
@@ -861,13 +1083,13 @@ ability trade {
   owned_tags  { state.trading }
 
   requirements {
-    target.creature
-    distance(self, target) <= 5
+    target_entity.creature
+    distance(self, target_entity) <= 5
     none {
       state.trading                  // can't open a 2nd trade
       self.status.dead
-      target.status.dead
-      target.status.untradable
+      target_entity.status.dead
+      target_entity.status.untradable
     }
   }
 
@@ -875,11 +1097,11 @@ ability trade {
   // `enabled` off, the wait wakes with `disabled = 1`, the body returns,
   // `on end` fires with no commit. No attribute writes were ever made.
   ongoing {
-    distance(self, target) <= 5
+    distance(self, target_entity) <= 5
     none {
       self.status.dead
-      target.status.dead
-      target.status.hostile
+      target_entity.status.dead
+      target_entity.status.hostile
     }
   }
 
@@ -896,7 +1118,7 @@ ability trade {
     locals[3] = 0
 
     // Open the trade window for both sides. UI / peer ability listens for this.
-    target.emit trade.opened { peer = self }
+    target_entity.emit trade.opened { peer = self }
 
     while true {
       // Hierarchical wait: wakes on any descendant of `trade`. 60s timeout.
@@ -906,15 +1128,15 @@ ability trade {
 
       if disabled or timed_out          { return }   // graceful end, no commit
       if event.tag == trade.cancel       { return }   // either side cancelled
-      if event.source != self and event.source != target { continue }  // ignore strays
+      if event.source != self and event.source != target_entity { continue }  // ignore strays
 
       if event.tag == trade.offer {
         // Peer (or self via UI) changed their offer. Reset both accept bits;
         // any prior accept is invalidated by a new offer.
         if event.source == self   { locals[0] = event.amount }
-        if event.source == target { locals[1] = event.amount; locals[3] += 1 }
+        if event.source == target_entity { locals[1] = event.amount; locals[3] += 1 }
         locals[2] = 0
-        target.emit trade.offer.refresh {
+        target_entity.emit trade.offer.refresh {
           mine   = locals[0]
           theirs = locals[1]
         }
@@ -927,22 +1149,22 @@ ability trade {
         if event.version != locals[3] { continue }
 
         if event.source == self   { locals[2] = locals[2] | 1 }
-        if event.source == target { locals[2] = locals[2] | 2 }
+        if event.source == target_entity { locals[2] = locals[2] | 2 }
 
         if locals[2] == 3 {
           // Both accepted at the same offer version — COMMIT.
           // First and only attribute writes in the entire ability.
           // Must also re-check funds at commit (peer may have spent gold
           // mid-trade via another script).
-          if self.gold   < locals[0] { target.emit trade.failed { reason = insufficient_self };   return }
-          if target.gold < locals[1] { target.emit trade.failed { reason = insufficient_target }; return }
+          if self.gold   < locals[0] { target_entity.emit trade.failed { reason = insufficient_self };   return }
+          if target_entity.gold < locals[1] { target_entity.emit trade.failed { reason = insufficient_target }; return }
 
           self.gold   -= locals[0]
-          target.gold += locals[0]
-          target.gold -= locals[1]
+          target_entity.gold += locals[0]
+          target_entity.gold -= locals[1]
           self.gold   += locals[1]
 
-          target.emit trade.committed { mine = locals[0], theirs = locals[1] }
+          target_entity.emit trade.committed { mine = locals[0], theirs = locals[1] }
           self.emit trade.committed { mine = locals[1], theirs = locals[0] }
           return
         }
@@ -955,7 +1177,7 @@ ability trade {
     // path. Just notify the peer that the trade window is gone, and let
     // owned_tags drop naturally with the record.
     if (locals[2] & 3) != 3 {
-      target.emit trade.aborted { }
+      target_entity.emit trade.aborted { }
     }
   }
 }
@@ -1106,7 +1328,7 @@ their value discarded (compiler inserts `POP`).
 | Form | Returns |
 |---|---|
 | `<integer>`, `1.5`, `30%`, `5s`, `30t` | fixed_t literal |
-| `self.attr`, `target.attr`, `source.attr` | fixed_t attribute value |
+| `self.attr`, `target_entity.attr`, `source_entity.attr` | fixed_t attribute value |
 | `event.X` | fixed_t payload field |
 | `locals[n]` | fixed_t coroutine local |
 | `stacks`, `now`, `timed_out`, `disabled` | fixed_t well-known |
@@ -1155,8 +1377,8 @@ path against an entity reference:
 
 ```
 self.health
-target.armor
-source.spell_power
+target_entity.armor
+source_entity.spell_power
 self.cooldown.fireball
 ```
 
@@ -1182,7 +1404,7 @@ Every numeric position in the language takes a formula:
 | Entity `attributes { tag = … }` initializer             | `self`, attributes initialised earlier in same block |
 | Ability `costs { mana = … }`                            | `self` (caster), `target`                          |
 | Ability `on activate` body's nested formulas            | `self`, `target`, ability locals                   |
-| Effect `duration = …`, `period = …`                     | `self` (target), `source` (applier), effect locals |
+| Effect `duration = …`, `period = …`                     | `self` (target_entity), `source_entity` (applier), effect locals |
 | Effect `every { <entity>.emit … { amount = … } }`        | `self`, `source`, `stacks`, effect locals          |
 | Event handler `on TAG { … }` body's formulas            | `self`, `event`, attributes of `self`              |
 | Event payload field formulas: `emit T { k = … }`        | scope where `emit` appears                         |
@@ -1190,8 +1412,8 @@ Every numeric position in the language takes a formula:
 
 Formulas can reference:
 
-- Attributes of any in-scope entity: `self.health`, `target.armor`,
-  `source.spell_power`, `self.health.max` (`.max` is just another tag).
+- Attributes of any in-scope entity: `self.health`, `target_entity.armor`,
+  `source_entity.spell_power`, `self.health.max` (`.max` is just another tag).
 - Bare attribute path → resolves to `self.<path>`.
 - Ability/effect record fields: `stacks`, `duration_left`, `time_alive`.
   (Well-known fields of the calling record, NOT attributes on the entity.)
@@ -1330,7 +1552,7 @@ are evaluated, then compared exactly (fixed-point).
 
 ```
 self.strength >= 50
-target.health <= target.health.max * 0.25
+target_entity.health <= target_entity.health.max * 0.25
 event.amount > self.armor
 now - self.last_hit_tick > 30
 ```
@@ -1340,16 +1562,16 @@ Bare attribute path on either side resolves to `self.<path>` (§ 6.3).
 ### 7.6 Naming subjects
 
 Tag clauses default to the *primary* subject of the container (usually
-`self`). Prefix with `target.`, `source.`, or `record.` to query another
+`self`). Prefix with `target_entity.`, `source_entity.`, or `record.` to query another
 entity / record:
 
 ```
 requirements {
   creature                       // self.creature
-  target.creature                // target's tag set
-  source.element.fire            // applier's tag set (effect requirements)
+  target_entity.creature                // target's tag set
+  source_entity.element.fire            // applier's tag set (effect requirements)
   self.health > 0                // predicate on self
-  target.armor < 100             // predicate on target
+  target_entity.armor < 100             // predicate on target
 }
 ```
 
@@ -1373,7 +1595,7 @@ requirements {
   self.health > self.health.max * 0.25
   any  { weapon.melee, weapon.ranged }      // must have a melee or ranged weapon
   any  { element.fire, element.arcane }     // AND must have fire or arcane element
-  none { status.silenced, status.stunned, target.status.invulnerable,
+  none { status.silenced, status.stunned, target_entity.status.invulnerable,
          self.cooldown.fireball > 0 }
 }
 
@@ -1562,7 +1784,7 @@ Cap lists derived from the effect's `source { }` / `target { }` blocks.
 At application time, the runtime reads `effect_assets[asset_idx]`, snapshots
 each declared attr inline into the `effect_hdr_t`. Caps are read-only after.
 
-Inside effect script bodies, the compiler resolves `source.X` / `self.X` for
+Inside effect script bodies, the compiler resolves `source_entity.X` / `self.X` for
 captured attrs to `LOAD_CAP_SRC` / `LOAD_CAP_TGT` opcodes (reads inline
 snapshot). Non-captured attrs fall back to live entity read (`LOAD_ATTR`).
 Transparent to the script author.
@@ -1813,7 +2035,7 @@ game script uses 4–12 registers total — no spill needed.
 
 **Expression codegen** (each expression returns its result register `dst`):
 - Literal → `LOAD_CONST dst, Kx`
-- `self.attr` (hot) → `LOAD_ATTR dst, tree`; `source.attr` → `LOAD_ATTR_S`; `target.attr` → `LOAD_ATTR_T`
+- `self.attr` (hot) → `LOAD_ATTR dst, tree`; `source_entity.attr` → `LOAD_ATTR_S`; `target_entity.attr` → `LOAD_ATTR_T`
 - `self.attr` (cold) → `LOAD_COLD dst, tag`
 - Captured attr → `LOAD_CAP_SRC dst, slot` / `LOAD_CAP_TGT dst, slot`
 - `a + b` → codegen `a`→rA, codegen `b`→rB, `ADD dst, rA, rB`; free rA, rB
@@ -1952,9 +2174,9 @@ all queries/formulas: `{ self = caster, target = target }`.
 queries/formulas: `{ self = target, source = source }`.
 
 1. Look up `effect_def_t* ed`.
-2. **Requirements.** Evaluate this effect's `requirements` query on target.
+2. **Requirements.** Evaluate this effect's `requirements` query on target_entity.
    Refuse if false. (Ward-style immunities are expressed here via
-   `none { target.immunity.<bucket> }` — see § 3.4.)
+   `none { target_entity.immunity.<bucket> }` — see § 3.4.)
 3. **Stack rule.** If existing `entity_effects` record with same `effect_tag`
    + same `source` exists, increment stacks (or refresh duration —
    compile-time per-effect choice).
@@ -2047,8 +2269,8 @@ Reserved subject names (cannot be tag names — compiler rejects):
 
 - `self` — current entity (the owner of an ability/effect, or the recipient
   of an event handler).
-- `target` — ability/effect target; `null` outside ability/effect activation.
-- `source` — applier of an effect; `null` outside effect contexts.
+- `target_entity` — ability/effect target; `null` outside ability/effect activation.
+- `source_entity` — applier of an effect; `null` outside effect contexts.
 - `record` — candidate ability/effect record inside a `cancel` query.
 - `event` — current event payload; `null` outside `on TAG` body.
 - `stacks` — current stack count of the calling effect record.
@@ -2072,9 +2294,9 @@ Reserved DSL keywords:
 - `requirements`, `ongoing`, `cancel` — query containers.
 - `costs`, `cooldowns`, `duration`, `period`, `every`, `attributes`, `effects`, `abilities` — body blocks.
 - `prefab`, `ability`, `effect` — top-level decls.
-- `commands` — top-level command-tag list (§ 2.6).
-- `command` — optional documentation prefix inside `commands { }`.
-- `input` — per-prefab input layout block (§ 2.6).
+- `command` — top-level typed-payload command decl (§ 2.6).
+- `entity`, `point` — param types inside `command { }`.
+- `input` — per-game input layout block (§ 2.6).
 - `button`, `stick` — input slot kinds.
 - `wait`, `wait_event`, `timeout`, `continue`, `break`, `emit`, `apply`, `remove`, `cancel`, `despawn`,
   `spawn`, `if`, `else`, `while`, `return` — statements.
@@ -2083,7 +2305,7 @@ Reserved DSL keywords:
   `distance`, `is_behind`, `is_in_front`, `angle_to`,
   `cooldown_remaining`, `for_each_in_radius` — builtins.
 
-None of these may be used as tag names anywhere in the script source.
+None of these may be used as tag names anywhere in the script source_entity.
 
 ---
 
@@ -2172,7 +2394,7 @@ Game code includes only `ecs_script.h`. All runtime functions take
   Compiler picks the top N most-referenced attribute tags (across all
   scripts and all entity inits) and assigns them to dedicated POD trees;
   the rest live in `attr_misc`. Stable-across-builds because reference
-  counts are a pure function of source.
+  counts are a pure function of source_entity.
 - **Reserved gaps for hot-reload** — adding a tag shifts every later ID. For
   dev iteration we accept the rebuild cost (bytecode re-emitted, live world
   remapped via tag-path lookup). Reserved-gap padding is *not* part of the

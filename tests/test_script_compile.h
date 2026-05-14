@@ -119,24 +119,30 @@ static void test_script_compile_samples(void) {
     SCC_CHECK(scc_find(&db, "health.max") != NULL);
     SCC_CHECK(scc_find(&db, "mana")       != NULL);
 
-    /* Command tags from `commands { }` block — plain tags, no def_offset. */
-    const tag_def_t* fire = scc_find(&db, "fire");
-    SCC_CHECK(fire != NULL);
-    if (fire) {
-        SCC_CHECK(tag_def_kind(fire) == TAG_KIND_TAG);
-        SCC_CHECK(tag_def_def_offset(fire) == 0);
-    }
-    SCC_CHECK(scc_find(&db, "jump")              != NULL);
-    SCC_CHECK(scc_find(&db, "crouch")            != NULL);
-    SCC_CHECK(scc_find(&db, "ability.iceblast")  != NULL);
-    /* ability.fireball appears in both commands {} and fireball.script — same tag. */
+    /* Command decls — typed top-level decls; tag kind = TAG_KIND_COMMAND. */
+    const tag_def_t* cast = scc_find(&db, "cast_ability");
+    SCC_CHECK(cast != NULL);
+    if (cast) SCC_CHECK(tag_def_kind(cast) == TAG_KIND_COMMAND);
+
+    const tag_def_t* cast_g = scc_find(&db, "cast_ability_ground");
+    SCC_CHECK(cast_g != NULL);
+    if (cast_g) SCC_CHECK(tag_def_kind(cast_g) == TAG_KIND_COMMAND);
+
+    /* Command param names (`target_entity`, `position`) interned as plain tags. */
+    SCC_CHECK(scc_find(&db, "target_entity") != NULL);
+    SCC_CHECK(scc_find(&db, "position")      != NULL);
 
     /* Input slot names — interned as plain tags via `input { }`. */
     const tag_def_t* move = scc_find(&db, "move");
     SCC_CHECK(move != NULL);
     if (move) SCC_CHECK(tag_def_kind(move) == TAG_KIND_TAG);
-    SCC_CHECK(scc_find(&db, "aim") != NULL);
-    /* `fire`, `jump`, `crouch` already checked above; input + commands share names. */
+    SCC_CHECK(scc_find(&db, "aim")    != NULL);
+    /* Button slot names also plain tags. */
+    const tag_def_t* fire = scc_find(&db, "fire");
+    SCC_CHECK(fire != NULL);
+    if (fire) SCC_CHECK(tag_def_kind(fire) == TAG_KIND_TAG);
+    SCC_CHECK(scc_find(&db, "jump")   != NULL);
+    SCC_CHECK(scc_find(&db, "crouch") != NULL);
 
     /* def_offset == 0 sentinel: plain tags (no def). At least one of the
        ancestor tags must hit this path. */

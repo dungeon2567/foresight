@@ -33,8 +33,8 @@ static void test_pi_sizing(void) {
     PI_CHECK(player_input_stride(8, 1)   == 6);   /* 16 + 32 = 48 → 6 */
     PI_CHECK(player_input_stride(16, 2)  == 12);  /* 32 + 64 = 96 → 12 */
 
-    PI_CHECK(player_input_wire_bits(8, 1)  == 40);  /* 8 + 32 */
-    PI_CHECK(player_input_wire_bits(16, 2) == 80);  /* 16 + 64 */
+    PI_CHECK(player_input_wire_bits(8, 1)  == 48);  /* 2*8 + 32 */
+    PI_CHECK(player_input_wire_bits(16, 2) == 96);  /* 2*16 + 64 */
     PI_CHECK(player_input_wire_bits(0, 0)  == 0);
 }
 
@@ -169,67 +169,64 @@ static void test_pi_tick_roll_unaligned(void) {
 }
 
 /* ==========================================================================
-   Full wire round-trip: write → serialize → deserialize → read; verify state
-   after tick_roll + read matches expected pressed/released/down edges.
+   Full wire round-trip. Wire = memory now (both down + was_down sent).
+
+   Sender prepares src with the desired final (down, was_down) state on
+   each button — typically by running tick_roll then writing fresh down.
+   Receiver reads the wire and applies verbatim; no receive-side roll.
    ========================================================================== */
 static void test_pi_wire_roundtrip(void) {
     const uint32_t N = 8;
     const uint32_t M = 1;
-    const uint32_t WIRE_BITS = player_input_wire_bits(N, M);  /* 8 + 32 = 40 */
+    const uint32_t WIRE_BITS = player_input_wire_bits(N, M);  /* 2*8 + 32 = 48 */
 
-    /* Source state at "this tick" — down bits set on buttons 0, 2, 5.
-       Stick at (x = 8000, y = -2000). stride = ceil((16+32)/8) = 6 */
+    /* Build src with explicit final state:
+         - button 0: rising  (down=1, was_down=0) → pressed
+         - button 2: held    (down=1, was_down=1)
+         - button 5: held    (down=1, was_down=1)
+         - button 4: idle    (down=0, was_down=0)
+       Stick at (x=8000, y=-2000). stride = 6 bytes. */
     uint8_t src[6] = {0};
-    pi_bit_set(src, 0, 1);
-    pi_bit_set(src, 2, 1);
-    pi_bit_set(src, 5, 1);
+    pi_bit_set(src, 0, 1);                    /* down[0]     */
+    pi_bit_set(src, 2, 1);                    /* down[2]     */
+    pi_bit_set(src, N + 2, 1);                /* was_down[2] */
+    pi_bit_set(src, 5, 1);                    /* down[5]     */
+    pi_bit_set(src, N + 5, 1);                /* was_down[5] */
     pi_bits_set(src, 2u * N,       16u, (uint16_t)(int16_t) 8000);
     pi_bits_set(src, 2u * N + 16u, 16u, (uint16_t)(int16_t)-2000);
 
-    /* Serialize to a 64-bit-aligned buffer (ecs_serializer requirement). */
+    /* Serialize. */
     uint64_t wire[2] = {0};
     ecs_serializer_t w;
     ecs_serializer_init(&w, wire, sizeof(wire));
     player_input_write(src, N, M, &w);
     ecs_serializer_flush_bits(&w);
-
-    /* Exact wire length emitted. */
     PI_CHECK((uint32_t)ecs_serializer_get_bits_written(&w) == WIRE_BITS);
 
-    /* Receiver side: dest holds last frame's state (button 2 was pressed,
-       button 5 was pressed). Run tick_roll, then read the wire. */
-    uint8_t dst[6] = {0};   /* stride for (N=8, M=1) */
-    pi_bit_set(dst, 2, 1);  /* button 2 was down last tick */
-    pi_bit_set(dst, 5, 1);  /* button 5 was down last tick */
-
-    player_input_tick_roll(dst, N, M);
-    /* After roll: was_down = old down. down still equals old down until wire
-       overwrites it. */
-    PI_CHECK(pi_btn_was_down(dst, N, 2) == 1);
-    PI_CHECK(pi_btn_was_down(dst, N, 5) == 1);
-
+    /* Deserialize into a fresh dst. No receiver-side roll needed. */
+    uint8_t dst[6] = {0};
     ecs_deserializer_t r;
     ecs_deserializer_init_bits(&r, wire, (int32_t)WIRE_BITS);
     player_input_read(dst, N, M, &r);
 
-    /* Verify down bits match source. */
-    PI_CHECK(pi_btn_down(dst, 0) == 1);
-    PI_CHECK(pi_btn_down(dst, 1) == 0);
-    PI_CHECK(pi_btn_down(dst, 2) == 1);
-    PI_CHECK(pi_btn_down(dst, 5) == 1);
+    /* Verify down + was_down survived end-to-end. */
+    PI_CHECK(pi_btn_down    (dst,    0) == 1);
+    PI_CHECK(pi_btn_was_down(dst, N, 0) == 0);
+    PI_CHECK(pi_btn_down    (dst,    2) == 1);
+    PI_CHECK(pi_btn_was_down(dst, N, 2) == 1);
+    PI_CHECK(pi_btn_down    (dst,    5) == 1);
+    PI_CHECK(pi_btn_was_down(dst, N, 5) == 1);
+    PI_CHECK(pi_btn_down    (dst,    4) == 0);
+    PI_CHECK(pi_btn_was_down(dst, N, 4) == 0);
 
-    /* Edge derivations:
-       - button 0: was_down 0, down 1 → pressed
-       - button 2: was_down 1, down 1 → held (neither pressed nor released)
-       - button 5: was_down 1, down 1 → held
-       - button 4: was_down 0, down 0 → idle */
-    PI_CHECK(pi_btn_pressed (dst, N, 0) == 1);
+    /* Edge derivations come straight from the two memory bits. */
+    PI_CHECK(pi_btn_pressed (dst, N, 0) == 1);   /* rising  */
     PI_CHECK(pi_btn_released(dst, N, 0) == 0);
-    PI_CHECK(pi_btn_pressed (dst, N, 2) == 0);
+    PI_CHECK(pi_btn_pressed (dst, N, 2) == 0);   /* held    */
     PI_CHECK(pi_btn_released(dst, N, 2) == 0);
-    PI_CHECK(pi_btn_pressed (dst, N, 5) == 0);
+    PI_CHECK(pi_btn_pressed (dst, N, 5) == 0);   /* held    */
     PI_CHECK(pi_btn_released(dst, N, 5) == 0);
-    PI_CHECK(pi_btn_pressed (dst, N, 4) == 0);
+    PI_CHECK(pi_btn_pressed (dst, N, 4) == 0);   /* idle    */
     PI_CHECK(pi_btn_released(dst, N, 4) == 0);
 
     /* Stick survived round-trip. */

@@ -90,6 +90,7 @@ void tag_schema_classify_parser(tag_schema_t* s, const parser_t* p) {
             case AST_DECL_PREFAB:  kind = TAG_KIND_PREFAB;  break;
             case AST_DECL_ABILITY: kind = TAG_KIND_ABILITY; break;
             case AST_DECL_EFFECT:  kind = TAG_KIND_EFFECT;  break;
+            case AST_DECL_COMMAND: kind = TAG_KIND_COMMAND; break;
             default: continue;
         }
         uint32_t idx = d->u.tag.tag_idx;
