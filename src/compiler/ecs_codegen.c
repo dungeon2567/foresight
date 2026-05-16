@@ -1,6 +1,7 @@
 #include "ecs_codegen.h"
 #include "ecs_schema.h"
 #include "../ecs_common.h"
+#include "../ecs_fixed.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -33,6 +34,8 @@ typedef struct {
     const ast_arena_t*   arena;
     const parser_t*      parser;     /* owner of arena + tag_strs */
     tag_schema_t*        schema;
+    const ecs_component_info_t* components;
+    uint32_t                    component_count;
     /* Scratch bytecode buffer for current formula/script. */
     uint32_t*            bc;
     uint32_t             bc_count;
@@ -844,6 +847,85 @@ static void emit_effect_decl(cg_t* c, ast_idx_t decl) {
     }
 }
 
+/* Look up a component reflection record by parser-local tag idx.
+   Returns NULL if no name match in the registered components table. */
+static const ecs_component_info_t* find_component_by_idx(const cg_t* c, uint32_t idx) {
+    if (!c->components || !c->parser || idx >= c->parser->tag_strs_count) return NULL;
+    const tag_str_t* ts = &c->parser->tag_strs[idx];
+    for (uint32_t i = 0; i < c->component_count; i++) {
+        const ecs_component_info_t* ci = &c->components[i];
+        size_t nl = strlen(ci->name);
+        if (nl == ts->len && memcmp(ci->name, ts->str, nl) == 0) return ci;
+    }
+    return NULL;
+}
+
+/* Look up a field by parser-local tag idx inside a component's field list. */
+static const ecs_component_field_t* find_component_field_by_idx(
+        const cg_t* c, const ecs_component_info_t* ci, uint32_t idx) {
+    if (!c->parser || idx >= c->parser->tag_strs_count) return NULL;
+    const tag_str_t* ts = &c->parser->tag_strs[idx];
+    for (uint32_t i = 0; i < ci->n_fields; i++) {
+        const ecs_component_field_t* f = &ci->fields[i];
+        size_t nl = strlen(f->name);
+        if (nl == ts->len && memcmp(f->name, ts->str, nl) == 0) return f;
+    }
+    return NULL;
+}
+
+/* Fold an AST expression into a literal int32_t + is_fixed flag. v1 only handles
+   AST_EXPR_LIT and unary minus of a literal. Anything else → returns 0 and
+   reports error via c->errored. */
+static int eval_lit_node(cg_t* c, ast_idx_t expr, int32_t* out_raw, int* out_is_fixed) {
+    const ast_node_t* n = &c->arena->nodes[expr];
+    if ((ast_kind_t)n->kind == AST_EXPR_LIT) {
+        *out_raw = n->u.lit;
+        *out_is_fixed = (n->flags & 1) != 0;
+        return 1;
+    }
+    if ((ast_kind_t)n->kind == AST_EXPR_UNOP && n->u.unop.op == UNOP_NEG) {
+        ast_idx_t ch = ast_child(c->arena, expr, 0);
+        if (!eval_lit_node(c, ch, out_raw, out_is_fixed)) return 0;
+        *out_raw = -*out_raw;
+        return 1;
+    }
+    c->errored = 1;
+    return 0;
+}
+
+/* Convert a literal's raw int32 to the in-slot representation for a scalar
+   target. fixed_t targets coerce int literals via fixed_from_int; integer
+   targets coerce fixed literals via fixed_to_int. Entity / time / generic
+   i32 all take raw bits. */
+static int32_t lit_to_target(int32_t raw, int is_fixed, uint8_t target_type) {
+    switch ((ecs_component_field_type_t)target_type) {
+        case ECS_COMP_FIELD_FIXED:
+            return is_fixed ? raw : fixed_from_int(raw);
+        case ECS_COMP_FIELD_I32:
+        case ECS_COMP_FIELD_ENTITY:
+        case ECS_COMP_FIELD_TIME:
+            return is_fixed ? fixed_to_int(raw) : raw;
+        default:
+            return raw;
+    }
+}
+
+/* Number of 4-byte field_write_t records a scalar field expands into.
+   QUAT_EULER returns 0 here — quat init is recorded separately in the
+   component_init_t.quat_inits array because the runtime path is an Euler→
+   quaternion conversion, not a memcpy. */
+static uint32_t field_type_n_writes(uint8_t t) {
+    switch ((ecs_component_field_type_t)t) {
+        case ECS_COMP_FIELD_VEC3_FIXED: return 3;
+        case ECS_COMP_FIELD_QUAT_EULER: return 0;
+        default:                        return 1;
+    }
+}
+
+static uint32_t field_type_n_quat_inits(uint8_t t) {
+    return (ecs_component_field_type_t)t == ECS_COMP_FIELD_QUAT_EULER ? 1u : 0u;
+}
+
 static void emit_prefab_decl(cg_t* c, ast_idx_t decl) {
     const ast_node_t* dn = &c->arena->nodes[decl];
     prefab_def_t* d = (prefab_def_t*)blob_alloc(c->w, sizeof(prefab_def_t),
@@ -896,13 +978,158 @@ static void emit_prefab_decl(cg_t* c, ast_idx_t decl) {
             blob_arr_set(&d->handlers, hd, n_h);
         }
     }
+    /* component inits — `compname { field = expr; ... }` blocks. Each block
+       resolves against the compiler's component reflection table. Unknown
+       component names or unknown fields trigger an error; the def is still
+       emitted (with the bad entry zeroed) so codegen continues to surface
+       additional errors in the same run. */
+    uint32_t n_ci = 0;
+    for (uint32_t k = 0; k < c->arena->nodes[body].n_children; k++) {
+        ast_idx_t bi = ast_child(c->arena, body, k);
+        if ((ast_kind_t)c->arena->nodes[bi].kind == AST_BLOCK_COMPONENT_INIT) n_ci++;
+    }
+    if (n_ci) {
+        component_init_t* arr = (component_init_t*)blob_alloc(
+            c->w, n_ci * sizeof(component_init_t), _Alignof(component_init_t));
+        if (arr) {
+            uint32_t ci_i = 0;
+            for (uint32_t k = 0; k < c->arena->nodes[body].n_children; k++) {
+                ast_idx_t bi = ast_child(c->arena, body, k);
+                if ((ast_kind_t)c->arena->nodes[bi].kind != AST_BLOCK_COMPONENT_INIT) continue;
+                const ast_node_t* bn = &c->arena->nodes[bi];
+                const ecs_component_info_t* info = find_component_by_idx(c, bn->u.tag.tag_idx);
+                if (!info) {
+                    fprintf(stderr, "codegen: unknown component '%.*s' in prefab init\n",
+                            (int)c->parser->tag_strs[bn->u.tag.tag_idx].len,
+                            c->parser->tag_strs[bn->u.tag.tag_idx].str);
+                    c->errored = 1;
+                    ci_i++;
+                    continue;
+                }
+                arr[ci_i].tree_idx  = info->tree_idx;
+                arr[ci_i].data_size = info->data_size;
+                uint32_t nf = bn->n_children;
+                if (nf) {
+                    /* Pass 1: count scalar writes vs. quat inits.
+                       VEC3 → 3 scalar writes. QUAT_EULER → 1 quat init.
+                       Plain scalars → 1 scalar write. */
+                    uint32_t total_w = 0, total_q = 0;
+                    for (uint32_t j = 0; j < nf; j++) {
+                        ast_idx_t fi = ast_child(c->arena, bi, j);
+                        const ast_node_t* fn = &c->arena->nodes[fi];
+                        const ecs_component_field_t* fdef =
+                            find_component_field_by_idx(c, info, fn->u.tag.tag_idx);
+                        if (!fdef) continue;
+                        total_w += field_type_n_writes(fdef->type);
+                        total_q += field_type_n_quat_inits(fdef->type);
+                    }
+                    field_write_t* fw = NULL;
+                    quat_init_t*   qa = NULL;
+                    if (total_w) {
+                        fw = (field_write_t*)blob_alloc(
+                            c->w, total_w * sizeof(field_write_t), _Alignof(field_write_t));
+                        if (!fw) { ci_i++; continue; }
+                    }
+                    if (total_q) {
+                        qa = (quat_init_t*)blob_alloc(
+                            c->w, total_q * sizeof(quat_init_t), _Alignof(quat_init_t));
+                        if (!qa) { ci_i++; continue; }
+                    }
+                    /* Pass 2: emit. */
+                    uint32_t wi = 0, qi = 0;
+                    for (uint32_t j = 0; j < nf; j++) {
+                        ast_idx_t fi = ast_child(c->arena, bi, j);
+                        const ast_node_t* fn = &c->arena->nodes[fi];
+                        const ecs_component_field_t* fdef =
+                            find_component_field_by_idx(c, info, fn->u.tag.tag_idx);
+                        if (!fdef) {
+                            fprintf(stderr,
+                                "codegen: unknown field '%.*s' on component '%s'\n",
+                                (int)c->parser->tag_strs[fn->u.tag.tag_idx].len,
+                                c->parser->tag_strs[fn->u.tag.tag_idx].str,
+                                info->name);
+                            c->errored = 1;
+                            continue;
+                        }
+                        ast_idx_t v = ast_child(c->arena, fi, 0);
+                        ecs_component_field_type_t ft =
+                            (ecs_component_field_type_t)fdef->type;
+                        if (ft == ECS_COMP_FIELD_VEC3_FIXED ||
+                            ft == ECS_COMP_FIELD_QUAT_EULER) {
+                            const ast_node_t* vn = &c->arena->nodes[v];
+                            if ((ast_kind_t)vn->kind != AST_EXPR_TUPLE ||
+                                vn->n_children != 3) {
+                                fprintf(stderr,
+                                    "codegen: field '%s' on component '%s' "
+                                    "expects 3-tuple (x, y, z)\n",
+                                    fdef->name, info->name);
+                                c->errored = 1;
+                                wi += field_type_n_writes(fdef->type);
+                                qi += field_type_n_quat_inits(fdef->type);
+                                continue;
+                            }
+                            int32_t raw[3]; int isfx[3];
+                            int ok = 1;
+                            for (uint32_t k = 0; k < 3; k++) {
+                                ast_idx_t ek = ast_child(c->arena, v, k);
+                                if (!eval_lit_node(c, ek, &raw[k], &isfx[k])) {
+                                    ok = 0;
+                                    break;
+                                }
+                            }
+                            if (!ok) {
+                                wi += field_type_n_writes(fdef->type);
+                                qi += field_type_n_quat_inits(fdef->type);
+                                continue;
+                            }
+                            if (ft == ECS_COMP_FIELD_VEC3_FIXED) {
+                                for (uint32_t k = 0; k < 3; k++) {
+                                    fw[wi].offset = fdef->offset + (uint16_t)(k * 4u);
+                                    fw[wi].type   = (uint8_t)ECS_COMP_FIELD_FIXED;
+                                    fw[wi].value  = lit_to_target(
+                                        raw[k], isfx[k], ECS_COMP_FIELD_FIXED);
+                                    wi++;
+                                }
+                            } else {
+                                /* Store raw Euler degrees as fixed_t for runtime
+                                   quat_from_euler_deg conversion. */
+                                qa[qi].offset = fdef->offset;
+                                for (uint32_t k = 0; k < 3; k++) {
+                                    qa[qi].euler_deg[k] = lit_to_target(
+                                        raw[k], isfx[k], ECS_COMP_FIELD_FIXED);
+                                }
+                                qi++;
+                            }
+                        } else {
+                            int32_t raw = 0; int isfx = 0;
+                            if (!eval_lit_node(c, v, &raw, &isfx)) {
+                                wi++;
+                                continue;
+                            }
+                            fw[wi].offset = fdef->offset;
+                            fw[wi].type   = fdef->type;
+                            fw[wi].value  = lit_to_target(raw, isfx, fdef->type);
+                            wi++;
+                        }
+                    }
+                    if (fw) blob_arr_set(&arr[ci_i].writes,     fw, wi);
+                    if (qa) blob_arr_set(&arr[ci_i].quat_inits, qa, qi);
+                }
+                ci_i++;
+            }
+            blob_arr_set(&d->component_inits, arr, n_ci);
+        }
+    }
 }
 
 void codegen_run(blob_writer_t* w, const parser_t* parser, ast_idx_t root,
-                 tag_schema_t* schema) {
+                 tag_schema_t* schema,
+                 const ecs_component_info_t* components,
+                 uint32_t component_count) {
     cg_t c;
     memset(&c, 0, sizeof(c));
     c.w = w; c.parser = parser; c.arena = &parser->arena; c.schema = schema;
+    c.components = components; c.component_count = component_count;
     const ast_arena_t* arena = c.arena;
     const ast_node_t* rn = &arena->nodes[root];
     for (uint32_t i = 0; i < rn->n_children; i++) {

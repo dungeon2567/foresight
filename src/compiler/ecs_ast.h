@@ -33,6 +33,8 @@ typedef enum {
     AST_BLOCK_EVERY,
     AST_BLOCK_SOURCE_CAPS,
     AST_BLOCK_TARGET_CAPS,
+    AST_BLOCK_COMPONENT_INIT,  /* `compname { f = expr; ... }` inside prefab body — u.tag.tag_idx = component name */
+    AST_COMPONENT_FIELD,       /* `field = expr` kv inside AST_BLOCK_COMPONENT_INIT — u.tag.tag_idx = field name; child 0 = expr */
     AST_ON_HOOK,
 
     AST_QUERY,
@@ -44,6 +46,7 @@ typedef enum {
     AST_CLAUSE_PRED,
 
     AST_EXPR_LIT,         /* integer / fixed literal */
+    AST_EXPR_TUPLE,       /* (a, b, c) — 2 or 3 components; used for vec/quat init */
     AST_EXPR_ATTR,        /* self/target/source.path */
     AST_EXPR_PAYLOAD,     /* event.field */
     AST_EXPR_LOCAL,       /* locals[n] */

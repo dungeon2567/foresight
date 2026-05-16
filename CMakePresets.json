@@ -56,6 +56,22 @@
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
             }
+        },
+        {
+            "name": "x64-app-debug",
+            "displayName": "x64 App Debug (ecs_app)",
+            "inherits": "x64-debug",
+            "cacheVariables": {
+                "ECS_BUILD_APP": "ON"
+            }
+        },
+        {
+            "name": "x64-app-release",
+            "displayName": "x64 App Release (ecs_app)",
+            "inherits": "x64-release",
+            "cacheVariables": {
+                "ECS_BUILD_APP": "ON"
+            }
         }
     ]
 }

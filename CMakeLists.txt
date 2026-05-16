@@ -214,6 +214,197 @@ if (ECS_BUILD_BENCH)
     list(APPEND _ecs_targets ecs_bench)
 endif()
 
+# -------------------------
+# Optional: ecs_app — SDL3 + wgpu-native + Dear ImGui demo host.
+#   Gated by -DECS_BUILD_APP=ON so test/bench builds stay lean.
+#   Native-first; CMake is structured to add an Emscripten preset later
+#   without touching the ecs / ecs_bench targets.
+# -------------------------
+option(ECS_BUILD_APP "Build the SDL3 + wgpu-native + ImGui demo (ecs_app)" OFF)
+
+if (ECS_BUILD_APP)
+    # ---- SDL3 (static) ---------------------------------------------------
+    set(SDL_SHARED       OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC       ON  CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS        OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES     OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        SDL3
+        GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+        GIT_TAG        release-3.2.0
+    )
+    FetchContent_MakeAvailable(SDL3)
+
+    # ---- wgpu-native (prebuilt release archive) --------------------------
+    # wgpu-native ships per-platform prebuilt zips with include/ and lib/.
+    # Pin to a known-good tag matching the Dear ImGui wgpu backend below.
+    set(_ECS_WGPU_TAG "v22.1.0.5")
+
+    if (WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_ECS_WGPU_URL "https://github.com/gfx-rs/wgpu-native/releases/download/${_ECS_WGPU_TAG}/wgpu-windows-x86_64-msvc-release.zip")
+    elseif (APPLE)
+        if (CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+            set(_ECS_WGPU_URL "https://github.com/gfx-rs/wgpu-native/releases/download/${_ECS_WGPU_TAG}/wgpu-macos-aarch64-release.zip")
+        else()
+            set(_ECS_WGPU_URL "https://github.com/gfx-rs/wgpu-native/releases/download/${_ECS_WGPU_TAG}/wgpu-macos-x86_64-release.zip")
+        endif()
+    elseif (UNIX)
+        set(_ECS_WGPU_URL "https://github.com/gfx-rs/wgpu-native/releases/download/${_ECS_WGPU_TAG}/wgpu-linux-x86_64-release.zip")
+    else()
+        message(FATAL_ERROR "ECS_BUILD_APP: no wgpu-native prebuilt URL for this platform.")
+    endif()
+
+    FetchContent_Declare(
+        wgpu_native
+        URL ${_ECS_WGPU_URL}
+    )
+    FetchContent_MakeAvailable(wgpu_native)
+
+    add_library(wgpu_native INTERFACE)
+    # wgpu-native ships headers under include/webgpu/ and include/wgpu/.
+    # wgpu.h does `#include "webgpu.h"` (no subdir prefix), so the inner
+    # `webgpu/` dir must be on the include path too.
+    target_include_directories(wgpu_native INTERFACE
+        ${wgpu_native_SOURCE_DIR}/include
+        ${wgpu_native_SOURCE_DIR}/include/webgpu
+    )
+
+    if (WIN32)
+        # Import lib for the shipped DLL; copy DLL next to the exe at build time.
+        target_link_libraries(wgpu_native INTERFACE
+            ${wgpu_native_SOURCE_DIR}/lib/wgpu_native.dll.lib
+            d3dcompiler
+            user32 gdi32 opengl32
+            ws2_32 userenv bcrypt ntdll
+        )
+    elseif (APPLE)
+        target_link_libraries(wgpu_native INTERFACE
+            ${wgpu_native_SOURCE_DIR}/lib/libwgpu_native.dylib
+            "-framework Metal"
+            "-framework QuartzCore"
+            "-framework Foundation"
+            "-framework Cocoa"
+            "-framework IOKit"
+        )
+    else()
+        target_link_libraries(wgpu_native INTERFACE
+            ${wgpu_native_SOURCE_DIR}/lib/libwgpu_native.so
+            ${CMAKE_DL_LIBS}
+            m
+        )
+    endif()
+
+    # ---- Dear ImGui (sources + SDL3 / wgpu backends) ---------------------
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG        v1.91.5-docking
+    )
+    FetchContent_MakeAvailable(imgui)
+
+    add_library(imgui STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_demo.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+    )
+    target_include_directories(imgui PUBLIC
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+    )
+    # Tell imgui_impl_wgpu.cpp which webgpu.h dialect it's compiling against.
+    target_compile_definitions(imgui PUBLIC IMGUI_IMPL_WEBGPU_BACKEND_WGPU)
+    target_link_libraries(imgui PUBLIC SDL3::SDL3-static wgpu_native)
+
+    # ---- ImGuiColorTextEdit (script editor: highlight + auto-indent) -----
+    FetchContent_Declare(
+        imgui_color_text_edit
+        GIT_REPOSITORY https://github.com/BalazsJako/ImGuiColorTextEdit.git
+        GIT_TAG        0a88824f7de8d0bd11d8419066caa7d3469395c4
+    )
+    FetchContent_MakeAvailable(imgui_color_text_edit)
+
+    # ImGui 1.91 removed ImGui::GetKeyIndex() (it now lives only behind the
+    # IMGUI_DISABLE_OBSOLETE_KEYIO opt-in). BalazsJako/ImGuiColorTextEdit is
+    # frozen since 2021 and still wraps every key with it. Strip the wrapper
+    # at configure time so the modern ImGuiKey_* values pass straight to
+    # IsKeyPressed/IsKeyDown.
+    set(_TE_SRC "${imgui_color_text_edit_SOURCE_DIR}/TextEditor.cpp")
+    if (EXISTS "${_TE_SRC}")
+        file(READ "${_TE_SRC}" _TE_CONTENT)
+        if (_TE_CONTENT MATCHES "ImGui::GetKeyIndex")
+            string(REGEX REPLACE
+                "ImGui::GetKeyIndex\\(([^)]+)\\)"
+                "\\1"
+                _TE_CONTENT "${_TE_CONTENT}")
+            file(WRITE "${_TE_SRC}" "${_TE_CONTENT}")
+            message(STATUS "Patched out ImGui::GetKeyIndex from TextEditor.cpp")
+        endif()
+    endif()
+    unset(_TE_CONTENT)
+    unset(_TE_SRC)
+
+    add_library(imgui_color_text_edit STATIC
+        ${imgui_color_text_edit_SOURCE_DIR}/TextEditor.cpp
+    )
+    target_include_directories(imgui_color_text_edit PUBLIC
+        ${imgui_color_text_edit_SOURCE_DIR}
+    )
+    target_link_libraries(imgui_color_text_edit PUBLIC imgui)
+    set_target_properties(imgui_color_text_edit PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+    )
+
+    # ---- ecs_app target --------------------------------------------------
+    add_executable(ecs_app
+        app/main.cpp
+        app/wgpu_surface_sdl.cpp
+        app/editor_ui.cpp
+        app/viewport_renderer.cpp
+    )
+    target_link_libraries(ecs_app PRIVATE
+        imgui
+        imgui_color_text_edit
+        SDL3::SDL3-static
+        wgpu_native
+    )
+    # Script editor panel scans this folder for *.script files.
+    target_compile_definitions(ecs_app PRIVATE
+        SCRIPTS_DIR="${CMAKE_SOURCE_DIR}/scripts"
+    )
+    set_target_properties(ecs_app PROPERTIES
+        CXX_STANDARD 17
+        CXX_STANDARD_REQUIRED ON
+        WIN32_EXECUTABLE OFF
+    )
+
+    if (WIN32)
+        # Stage the wgpu_native runtime DLL next to ecs_app.exe so the
+        # debugger and `cmake --build && run` cycle both work without
+        # touching PATH.
+        add_custom_command(TARGET ecs_app POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${wgpu_native_SOURCE_DIR}/lib/wgpu_native.dll
+                $<TARGET_FILE_DIR:ecs_app>
+            VERBATIM
+        )
+    endif()
+
+    # Stage the body font next to the exe so ImGui can load it at startup.
+    # Roboto-Medium ships with the Dear ImGui source tree under misc/fonts/.
+    add_custom_command(TARGET ecs_app POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf
+            $<TARGET_FILE_DIR:ecs_app>
+        VERBATIM
+    )
+endif()
+
 foreach(_tgt ${_ecs_targets})
     if (CMAKE_C_COMPILER_ID STREQUAL "Clang"
         AND CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")

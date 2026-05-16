@@ -33,6 +33,12 @@ prefab player {
         unit.player
     }
 
+    transform {
+        position = (0, 0, 0)
+        rotation = (45, 45, 45)
+        scale    = (1, 1, 1)
+    }
+
     attributes {
         health     = 100
         health.max = 100

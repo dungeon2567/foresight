@@ -231,6 +231,21 @@ static ast_idx_t parse_primary(parse_ctx_t* c) {
     if (t.kind == TOK_LPAREN) {
         lexer_next(&c->p->lex);
         ast_idx_t e = parse_expr(c);
+        if (check(c->p, TOK_COMMA)) {
+            /* Tuple literal: `(a, b)` or `(a, b, c)`. Used for vec3 / quat field
+               init on component blocks. Trailing comma allowed. */
+            uint32_t saved = c->kids_count;
+            kids_push(c, e);
+            while (match(c->p, TOK_COMMA)) {
+                if (check(c->p, TOK_RPAREN)) break;
+                kids_push(c, parse_expr(c));
+            }
+            expect(c->p, TOK_RPAREN, "expected ')'");
+            ast_idx_t n = arena_alloc(&c->p->arena, AST_EXPR_TUPLE);
+            set_children(&c->p->arena, n, &c->kids_buf[saved], c->kids_count - saved);
+            c->kids_count = saved;
+            return n;
+        }
         expect(c->p, TOK_RPAREN, "expected ')'");
         return e;
     }
@@ -763,6 +778,35 @@ static ast_idx_t parse_body_block(parse_ctx_t* c) {
             case TOK_KW_SOURCE: lexer_next(&c->p->lex); sub = parse_tag_list_block(c, AST_BLOCK_SOURCE_CAPS); break;
             case TOK_KW_TARGET: lexer_next(&c->p->lex); sub = parse_tag_list_block(c, AST_BLOCK_TARGET_CAPS); break;
             case TOK_KW_ON:     sub = parse_on_hook(c); break;
+            case TOK_IDENT: {
+                /* Component-init block: `compname { field = expr; ... }`.
+                   compname is a bare ident; tells prefabs which component to
+                   add+initialize on the spawned entity. Field names + types
+                   are resolved against the compiler's component reflection
+                   table during codegen (codegen errors if unknown). */
+                token_t name = lexer_next(&c->p->lex);
+                uint32_t name_idx = intern_tag(c->p, name.start, name.len);
+                expect(c->p, TOK_LBRACE, "expected '{' after component name");
+                uint32_t fsaved = c->kids_count;
+                while (!check(c->p, TOK_RBRACE) && !check(c->p, TOK_EOF)) {
+                    token_t fname = expect_name(c->p, "expected field name");
+                    expect(c->p, TOK_ASSIGN, "expected '='");
+                    ast_idx_t fv = parse_expr(c);
+                    ast_idx_t fn = arena_alloc(&c->p->arena, AST_COMPONENT_FIELD);
+                    c->p->arena.nodes[fn].u.tag.tag_idx = intern_tag(c->p, fname.start, fname.len);
+                    ast_idx_t fkk[1] = { fv };
+                    set_children(&c->p->arena, fn, fkk, 1);
+                    kids_push(c, fn);
+                    match(c->p, TOK_COMMA);
+                    match(c->p, TOK_SEMICOLON);
+                }
+                expect(c->p, TOK_RBRACE, "expected '}'");
+                ast_idx_t cn = arena_alloc(&c->p->arena, AST_BLOCK_COMPONENT_INIT);
+                c->p->arena.nodes[cn].u.tag.tag_idx = name_idx;
+                set_children(&c->p->arena, cn, &c->kids_buf[fsaved], c->kids_count - fsaved);
+                c->kids_count = fsaved;
+                sub = cn;
+            } break;
             default:
                 error(c->p, "unexpected token in body");
                 consume(c->p);

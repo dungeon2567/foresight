@@ -101,6 +101,34 @@ typedef struct {
     blob_arr_t script_bc;  /* uint32_t[] */
 } handler_def_t;
 
+/* One initialized field inside a prefab `compname { ... }` block. v1: literal
+   only; runtime memcpy's `value` truncated to the field's type-width into the
+   component slot at `offset`. */
+typedef struct {
+    uint16_t  offset;          /* byte offset inside component struct */
+    uint8_t   type;            /* ecs_component_field_type_t */
+    int32_t   value;           /* literal — fixed/i32 fit directly; u8/u16 truncated */
+} field_write_t;
+
+/* Euler-to-quaternion init. DSL `rotation = (x, y, z)` stores the raw Euler
+   degrees here; runtime spawn calls quat_from_euler_deg() and stores the
+   resulting quat_t at `offset`. Kept separate from `field_write_t` because
+   the runtime path is non-trivial (math eval, not memcpy). */
+typedef struct {
+    uint16_t offset;           /* offset of quat[0] in component struct */
+    int32_t  euler_deg[3];     /* fixed_t Euler degrees (x, y, z) */
+} quat_init_t;
+
+/* One component add+init record on a prefab. Resolved at compile time:
+   tree_idx + data_size + field offsets all baked in. Runtime does
+   ecs_tree_get_mut + per-field memcpy + (rare) quat conversions. */
+typedef struct {
+    uint8_t    tree_idx;       /* world->trees[N], 2..63 */
+    uint16_t   data_size;      /* size of the component struct */
+    blob_arr_t writes;         /* field_write_t[] — uniform 4B scalars */
+    blob_arr_t quat_inits;     /* quat_init_t[] — Euler→quat at spawn */
+} component_init_t;
+
 /* tag_query_t forward-declared; defined in ecs_script_query.h */
 typedef struct tag_query_t tag_query_t;
 
@@ -118,6 +146,7 @@ typedef struct {
                                 external source. */
     blob_arr_t abilities;   /* uint16_t[] sorted ascending — logical count */
     blob_arr_t handlers;    /* handler_def_t[] */
+    blob_arr_t component_inits;  /* component_init_t[] — add+init at spawn */
 } prefab_def_t;
 
 typedef struct {

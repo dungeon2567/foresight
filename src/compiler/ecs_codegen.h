@@ -83,5 +83,8 @@ prefab_def_t*  codegen_prefab_def (blob_writer_t* w, const void* blob_root,
    sub-data adjacent in the blob (queries, owned_tags, bytecode, etc.).
    schema is mutated: each decl's def_offset is written to its schema_tag_t.
    parser owns the AST arena + tag_strs; both are read by codegen. */
+#include "ecs_compiler.h"   /* ecs_component_info_t — for the reflection table arg below */
 void codegen_run(blob_writer_t* w, const parser_t* parser, ast_idx_t root,
-                 tag_schema_t* schema);
+                 tag_schema_t* schema,
+                 const ecs_component_info_t* components,
+                 uint32_t component_count);

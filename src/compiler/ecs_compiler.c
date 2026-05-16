@@ -83,7 +83,7 @@ int compiler_build(const compiler_opts_t* opts, script_db_t* db) {
         if (!sources[i]) continue;
         ast_idx_t r = parser_root(&parsers[i]);
         if (r == 0) continue;
-        codegen_run(&w, &parsers[i], r, &schema);
+        codegen_run(&w, &parsers[i], r, &schema, opts->components, opts->component_count);
     }
 
     /* Pass 6: copy schema's def_offset into tag_defs[]. Kind already packed in

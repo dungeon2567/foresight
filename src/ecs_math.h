@@ -255,6 +255,29 @@ static inline quat_t quat_normalize(quat_t a) {
 }
 
 /* axis must be unit-length. Half-angle sin/cos via the polynomial sin/cos. */
+/* Intrinsic Tait-Bryan XYZ Euler (degrees) → unit quaternion. Rotate around
+   X first, then Y, then Z (body frame); composite = qx * qy * qz. Inputs are
+   fixed_t degrees; conversion to radians uses pi/180 ≈ 0.017453292 (Q16.16
+   ≈ 1144). Used by prefab `rotation = (x, y, z)` runtime init. */
+#define FIXED_DEG2RAD  ((fixed_t)1144)   /* pi/180 in Q16.16 */
+static inline quat_t quat_from_euler_deg(fixed_t xdeg, fixed_t ydeg, fixed_t zdeg) {
+    fixed_t hx = fixed_mul(xdeg, FIXED_DEG2RAD) / 2;
+    fixed_t hy = fixed_mul(ydeg, FIXED_DEG2RAD) / 2;
+    fixed_t hz = fixed_mul(zdeg, FIXED_DEG2RAD) / 2;
+    fixed_t cx = fixed_cos(hx), sx = fixed_sin(hx);
+    fixed_t cy = fixed_cos(hy), sy = fixed_sin(hy);
+    fixed_t cz = fixed_cos(hz), sz = fixed_sin(hz);
+    fixed_t cy_cz = fixed_mul(cy, cz);
+    fixed_t cy_sz = fixed_mul(cy, sz);
+    fixed_t sy_cz = fixed_mul(sy, cz);
+    fixed_t sy_sz = fixed_mul(sy, sz);
+    return quat_make(
+        fixed_add(fixed_mul(sx, cy_cz), fixed_mul(cx, sy_sz)),
+        fixed_sub(fixed_mul(cx, sy_cz), fixed_mul(sx, cy_sz)),
+        fixed_add(fixed_mul(cx, cy_sz), fixed_mul(sx, sy_cz)),
+        fixed_sub(fixed_mul(cx, cy_cz), fixed_mul(sx, sy_sz)));
+}
+
 static inline quat_t quat_from_axis_angle(fixed_4_t axis, fixed_t angle) {
     fixed_t half = angle / 2;
     fixed_t s = fixed_sin(half);
